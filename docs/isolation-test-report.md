@@ -457,21 +457,25 @@ A pod creating many threads generates scheduler pressure even with cgroup CPU li
 ### Setup
 
 - **Noisy pod:** 500 threads in a tight loop (short computation + `sleep(0.001)`), with `cpu.limit: 1`
+- **Victim pod:** Runs a fixed computation (sum of 10,000 squares) 2,000 times, measures per-iteration latency (runc, no CPU limit)
 - **Host:** 4 vCPUs
-- **Measurement:** Host load average, host thread count
+- **Measurement:** Host load average, host thread count, victim compute latency
 
 ### Results
 
 | Metric | Baseline | runc noisy | kata noisy |
 |--------|----------|------------|------------|
-| Host load average | 0.31 | **7.74** | **0.27** |
-| Host thread count | 423 | **937 (+514)** | **434 (+11)** |
+| Host load average (1-min) | 0.36 | **95 - 118** | **1.1 - 2.3** |
+| Host thread count | 400 | **913 (+513)** | **411 (+11)** |
+| Victim compute p50 | 2.0 ms | 2.1 ms | 2.1 ms |
+| Victim compute p95 | 2.4 ms | **7.5 ms (3x)** | **5.1 ms (2x)** |
+| Victim compute mean | 2.1 ms | **3.0 ms (+43%)** | **2.5 ms (+19%)** |
 
 ### Analysis
 
-**Kata isolates scheduler pressure.** With runc, 500 pod threads become 500 host-schedulable threads, raising load average from 0.31 to 7.74 (25x). With kata, the 500 threads exist inside the guest VM — the host only sees the QEMU process, and load average stays at baseline.
+**Kata isolates scheduler pressure.** With runc, 500 pod threads become 500 host-schedulable threads, raising load average from 0.36 to 95-118 (300x). With kata, the 500 threads exist inside the guest VM — the host only sees the QEMU process (+11 threads), and load average stays near baseline.
 
-Load average is a key signal for node health monitoring and autoscaling. A runc pod spawning many threads inflates load average even with cgroup CPU limits in place, potentially triggering false alarms. With kata, load average remains a reliable health signal.
+Victim compute latency shows runc noise degrades p95 by 3x (2.4ms → 7.5ms) and mean by 43%. Kata noise has a smaller impact: p95 by 2x and mean by 19%. The residual kata impact comes from the QEMU vCPU thread consuming 1 of 4 host CPUs — this is normal CPU contention (same as any single-threaded process using 1 CPU), not scheduler overhead. On hosts with more CPUs, this impact would be proportionally smaller.
 
 ---
 
