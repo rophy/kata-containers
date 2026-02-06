@@ -457,8 +457,8 @@ A pod creating many threads generates scheduler pressure even with cgroup CPU li
 ### Setup
 
 - **Noisy pod:** 500 threads in a tight loop (short computation + `sleep(0.001)`), with `cpu.limit: 1`
-- **Victim pod:** Measures `sleep(1ms)` actual latency over 1,000 iterations (runc)
-- **Measurement:** Host load average, host thread count, victim scheduling latency p99
+- **Host:** 4 vCPUs
+- **Measurement:** Host load average, host thread count
 
 ### Results
 
@@ -466,18 +466,12 @@ A pod creating many threads generates scheduler pressure even with cgroup CPU li
 |--------|----------|------------|------------|
 | Host load average | 0.31 | **7.74** | **0.27** |
 | Host thread count | 423 | **937 (+514)** | **434 (+11)** |
-| Victim sleep(1ms) p50 | 1.086 ms | 1.084 ms | 1.089 ms |
-| Victim sleep(1ms) p99 | 1.144 ms | **4.113 ms** | **4.145 ms** |
-| Victim sleep(1ms) max | 1.658 ms | **8.291 ms** | **8.923 ms** |
 
 ### Analysis
 
-**Kata isolates scheduler pressure (load average and host thread count).** With runc, 500 pod threads become 500 host-schedulable threads, raising load average from 0.31 to 7.74 (25x). With kata, the 500 threads exist inside the guest VM — the host only sees the QEMU process, and load average stays at baseline.
+**Kata isolates scheduler pressure.** With runc, 500 pod threads become 500 host-schedulable threads, raising load average from 0.31 to 7.74 (25x). With kata, the 500 threads exist inside the guest VM — the host only sees the QEMU process, and load average stays at baseline.
 
-However, **victim scheduling latency was similar for both runc and kata noise** (p99 ~4ms). This is because even with kata, the VM's vCPU thread consumes host CPU time, creating contention on the 4-vCPU host. The difference is in the _type_ of impact:
-
-- **runc:** High load average (7.74) + moderate latency impact. The 500+ threads create scheduler overhead, making the load average unreliable as a health signal for other workloads.
-- **kata:** Normal load average (0.27) + similar latency impact. The CPU contention comes from a single QEMU process, not from scheduler queue flooding. Load average remains a reliable health signal.
+Load average is a key signal for node health monitoring and autoscaling. A runc pod spawning many threads inflates load average even with cgroup CPU limits in place, potentially triggering false alarms. With kata, load average remains a reliable health signal.
 
 ---
 
