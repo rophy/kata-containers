@@ -448,6 +448,39 @@ Every file access (open, stat, readdir) creates dentry and inode cache entries i
 
 ---
 
+## Test 12: CPU Scheduler Pressure (High Load)
+
+### Scenario
+
+A pod creating many threads generates scheduler pressure even with cgroup CPU limits. Each thread is a schedulable entity in the host kernel. With 500 threads competing on a 4-vCPU host, context switch overhead and run queue depth increase, raising the load average and degrading scheduling latency for other pods. Cgroup CPU controller limits CPU **time** (bandwidth) but does NOT limit the number of schedulable threads or the scheduling overhead they create.
+
+### Setup
+
+- **Noisy pod:** 500 threads in a tight loop (short computation + `sleep(0.001)`), with `cpu.limit: 1`
+- **Victim pod:** Measures `sleep(1ms)` actual latency over 1,000 iterations (runc)
+- **Measurement:** Host load average, host thread count, victim scheduling latency p99
+
+### Results
+
+| Metric | Baseline | runc noisy | kata noisy |
+|--------|----------|------------|------------|
+| Host load average | 0.31 | **7.74** | **0.27** |
+| Host thread count | 423 | **937 (+514)** | **434 (+11)** |
+| Victim sleep(1ms) p50 | 1.086 ms | 1.084 ms | 1.089 ms |
+| Victim sleep(1ms) p99 | 1.144 ms | **4.113 ms** | **4.145 ms** |
+| Victim sleep(1ms) max | 1.658 ms | **8.291 ms** | **8.923 ms** |
+
+### Analysis
+
+**Kata isolates scheduler pressure (load average and host thread count).** With runc, 500 pod threads become 500 host-schedulable threads, raising load average from 0.31 to 7.74 (25x). With kata, the 500 threads exist inside the guest VM — the host only sees the QEMU process, and load average stays at baseline.
+
+However, **victim scheduling latency was similar for both runc and kata noise** (p99 ~4ms). This is because even with kata, the VM's vCPU thread consumes host CPU time, creating contention on the 4-vCPU host. The difference is in the _type_ of impact:
+
+- **runc:** High load average (7.74) + moderate latency impact. The 500+ threads create scheduler overhead, making the load average unreliable as a health signal for other workloads.
+- **kata:** Normal load average (0.27) + similar latency impact. The CPU contention comes from a single QEMU process, not from scheduler queue flooding. Load average remains a reliable health signal.
+
+---
+
 ## Summary
 
 ### Isolation Properties: runc vs Kata
@@ -465,6 +498,7 @@ Every file access (open, stat, readdir) creates dentry and inode cache entries i
 | **Disk space** | **Shared host filesystem** | **Shared via virtio-fs** |
 | **Dentry / inode cache (slab)** | **Shared host kernel** | **Shared via virtio-fs** |
 | **Process table (PIDs)** | **Shared host kernel** | Isolated (per-VM kernel) |
+| **Scheduler pressure (load average)** | **Shared (500 threads → load 7.74)** | Isolated (load stays at baseline) |
 | **Kernel scheduler** | **Shared** | Isolated |
 | **Kernel memory (slab, page tables)** | **Shared** | Isolated |
 | **Kernel crash** | **Takes down all pods** | Contained to one VM |
