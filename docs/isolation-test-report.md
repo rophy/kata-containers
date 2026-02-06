@@ -474,7 +474,33 @@ Neither runtime isolates mount point creation from the host — both are managed
 
 ---
 
-## Test 13: CPU Scheduler Pressure (High Load)
+## Test 13: Socket Buffer Memory
+
+### Scenario
+
+Each TCP connection consumes kernel memory for send and receive buffers. The host kernel tracks total TCP memory usage via `/proc/net/sockstat` (`mem` field, in pages). A pod creating thousands of connections with data in flight consumes host TCP memory, reducing what's available for other pods and system services.
+
+### Setup
+
+- **runc and kata-qemu pods** each create 1,000 TCP connections (loopback) with 4KB of data per connection
+- **Measurement:** `cat /proc/net/sockstat` on the node before and after
+
+### Results
+
+| Metric | Baseline | runc (1,000 conns) | kata (1,000 conns) |
+|--------|----------|-------------------|-------------------|
+| TCP alloc | 213 | **2,223 (+2,010)** | **224 (+9)** |
+| TCP mem (pages) | 0 | **2,031 (~8 MB)** | **0** |
+
+### Analysis
+
+**Kata isolates socket buffer memory.** The 1,000 TCP connections and their 4KB buffers exist entirely inside the guest kernel. Host TCP memory stays at 0.
+
+With runc, 1,000 connections with 4KB data each consumed ~8MB of host kernel TCP buffer memory. This memory is subject to the system-wide `net.ipv4.tcp_mem` limit and is shared by all processes on the node.
+
+---
+
+## Test 14: CPU Scheduler Pressure (High Load)
 
 ### Scenario
 
@@ -522,6 +548,7 @@ Victim compute latency shows runc noise degrades p95 by 3x (2.4ms → 7.5ms) and
 | **Disk space** | **Shared host filesystem** | **Shared via virtio-fs** |
 | **Dentry / inode cache (slab)** | **Shared host kernel** | **Shared via virtio-fs** |
 | **Mount points** | **Shared (+7 per pod)** | **Shared (+8 per pod)** |
+| **Socket buffer memory** | **Shared host kernel** | Isolated (per-VM kernel) |
 | **Process table (PIDs)** | **Shared host kernel** | Isolated (per-VM kernel) |
 | **Scheduler pressure (load average)** | **Shared (500 threads → load 95)** | Isolated (load stays at baseline) |
 | **Kernel scheduler** | **Shared** | Isolated |

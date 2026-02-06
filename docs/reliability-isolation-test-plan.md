@@ -203,5 +203,5 @@ sysctl fs.inotify
 | 10 | Mount points | soft (memory) | None | **No** (both +7-8) | Tested |
 | 11 | Disk space | filesystem size | None (quota only) | **No** | Tested |
 | 12 | Dentry/inode cache | slab memory | memory cgroup (partial) | **No** (virtio-fs) | Tested |
-| 13 | Socket buffer memory | `net.ipv4.tcp_mem` | memory cgroup (partial) | Yes | |
+| 13 | Socket buffer memory | `net.ipv4.tcp_mem` | memory cgroup (partial) | **Yes** | Tested |
 | 14 | Entropy pool | pool size | None | TBD (modern kernels) | |
