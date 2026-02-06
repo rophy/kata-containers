@@ -448,7 +448,33 @@ Every file access (open, stat, readdir) creates dentry and inode cache entries i
 
 ---
 
-## Test 12: CPU Scheduler Pressure (High Load)
+## Test 12: Mount Points
+
+### Scenario
+
+Each pod creates multiple mount entries on the host (overlay filesystems, tmpfs, namespace files). The host mount table is a shared kernel data structure. If too many mounts accumulate, it can affect mount lookup performance and consume kernel memory.
+
+### Setup
+
+- Measure host mount count (`cat /proc/mounts | wc -l`) before and after creating each pod
+- Diff `/proc/mounts` to identify what mounts each pod type creates
+
+### Results
+
+| Client | Host mount delta | Mount types |
+|--------|-----------------|-------------|
+| **runc** | **+7** | tmpfs (projected vol), shm, 3x nsfs (uts/ipc/net), 2x overlay (container layers) |
+| **kata-qemu** | **+8** | Same as runc + 1 extra overlay (kata guest image layers) |
+
+### Analysis
+
+**Both runc and kata create similar host mounts per pod.** Kata creates one additional overlay mount for the guest image, but otherwise the host-side mount footprint is comparable. Mount points are cleaned up when the pod is deleted (host count returns to baseline).
+
+Neither runtime isolates mount point creation from the host — both are managed by CRI-O on the host side, not inside the container or VM.
+
+---
+
+## Test 13: CPU Scheduler Pressure (High Load)
 
 ### Scenario
 
@@ -495,8 +521,9 @@ Victim compute latency shows runc noise degrades p95 by 3x (2.4ms → 7.5ms) and
 | **ARP / neighbour table** | Isolated (per-pod netns) | Isolated (per-VM netns) |
 | **Disk space** | **Shared host filesystem** | **Shared via virtio-fs** |
 | **Dentry / inode cache (slab)** | **Shared host kernel** | **Shared via virtio-fs** |
+| **Mount points** | **Shared (+7 per pod)** | **Shared (+8 per pod)** |
 | **Process table (PIDs)** | **Shared host kernel** | Isolated (per-VM kernel) |
-| **Scheduler pressure (load average)** | **Shared (500 threads → load 7.74)** | Isolated (load stays at baseline) |
+| **Scheduler pressure (load average)** | **Shared (500 threads → load 95)** | Isolated (load stays at baseline) |
 | **Kernel scheduler** | **Shared** | Isolated |
 | **Kernel memory (slab, page tables)** | **Shared** | Isolated |
 | **Kernel crash** | **Takes down all pods** | Contained to one VM |

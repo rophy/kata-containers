@@ -200,7 +200,7 @@ sysctl fs.inotify
 | 7 | Inotify watches | `fs.inotify.max_user_watches` | None | **Yes** | Tested |
 | 8 | Inotify instances | `fs.inotify.max_user_instances` | None | **Yes** | Tested |
 | 9 | ARP table | `neigh/default/gc_thresh3` | None | N/A (per-netns) | Tested |
-| 10 | Mount points | soft (memory) | None | Partial | |
+| 10 | Mount points | soft (memory) | None | **No** (both +7-8) | Tested |
 | 11 | Disk space | filesystem size | None (quota only) | **No** | Tested |
 | 12 | Dentry/inode cache | slab memory | memory cgroup (partial) | **No** (virtio-fs) | Tested |
 | 13 | Socket buffer memory | `net.ipv4.tcp_mem` | memory cgroup (partial) | Yes | |
