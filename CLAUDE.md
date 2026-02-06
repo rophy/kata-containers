@@ -1,5 +1,29 @@
 # Kata Containers Development Notes
 
+## Quick Reference
+
+**kubectl context:** `minikube`
+
+**Quick setup (after minikube exists):**
+```bash
+# Remount persistent storage (lost on VM restart)
+minikube ssh "sudo mkdir -p /mnt/vda1/opt/kata && sudo mkdir -p /opt/kata && sudo mount --bind /mnt/vda1/opt/kata /opt/kata"
+
+# Install Kata with Dragonball
+helm install kata-deploy ./tools/packaging/kata-deploy/helm-chart/kata-deploy \
+  --namespace kube-system \
+  --set shims.disableAll=true \
+  --set shims.dragonball.enabled=true \
+  --set defaultShim.amd64=dragonball \
+  --set runtimeClasses.createDefault=false \
+  --set debug=true
+
+# Wait for installation
+kubectl --context minikube wait --for=condition=ready pod -l app=kata-deploy -n kube-system --timeout=600s
+```
+
+---
+
 ## Testing Kata + Dragonball with Minikube (Nested VM)
 
 This guide describes how to run Kubernetes with Kata Containers and Dragonball hypervisor in a nested VM environment using Minikube.
