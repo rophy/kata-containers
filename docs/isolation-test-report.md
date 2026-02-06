@@ -352,6 +352,102 @@ With runc, inotify watches are in the host kernel. A pod creating 1,000 watches 
 
 ---
 
+## Test 8: Inotify Instance Exhaustion
+
+### Scenario
+
+Each `inotify_init()` call creates an inotify instance, limited by `fs.inotify.max_user_instances` (default 1,024). Applications like container runtimes, log agents, and monitoring tools each create instances.
+
+### Setup
+
+- **runc and kata-qemu pods** each create 100 inotify instances
+- **Measurement:** Count `anon_inode:inotify` file descriptors across all host processes
+
+### Results
+
+| Client | Instances created | Host inotify instance delta |
+|--------|------------------|----------------------------|
+| **runc** | 100 | **+100** |
+| **kata-qemu** | 100 | **0** |
+
+### Analysis
+
+**Kata isolates inotify instances.** Instances created inside a kata pod exist in the guest kernel and do not consume host inotify instances. With runc, each `inotify_init()` creates a host kernel inotify instance.
+
+---
+
+## Test 9: ARP / Neighbour Table
+
+### Scenario
+
+Each unique IP a pod communicates with could add an ARP entry to the host's neighbour table (`net.ipv4.neigh.default.gc_thresh3`). If the table fills, new connections fail with "neighbour table overflow".
+
+### Setup
+
+- **runc and kata-qemu pods** each make TCP connections to 20 different IPs
+- **Measurement:** `ip neigh show | wc -l` on the node before and after
+
+### Results
+
+| Client | IPs contacted | Host ARP delta |
+|--------|--------------|---------------|
+| **runc** | 20 | **+1** |
+| **kata-qemu** | 20 | **+1** |
+
+### Analysis
+
+**ARP table is already isolated by network namespaces**, similar to TCP ports. Calico uses proxy ARP — each pod sees only one ARP entry (gateway 169.254.1.1) regardless of how many IPs it contacts. The host does L3 routing, not L2 ARP resolution per destination. Neither runc nor kata creates per-destination ARP entries on the host.
+
+---
+
+## Test 10: Disk Space
+
+### Scenario
+
+Container writes to rootfs (`/tmp`) and PVC consume host disk space via the overlay/virtio-fs filesystem.
+
+### Setup
+
+- **runc and kata-qemu pods** each write a 100MB file to `/tmp`
+- **Measurement:** `df -m /` on the node before and after
+
+### Results
+
+| Client | Bytes written | Host disk delta |
+|--------|--------------|----------------|
+| **runc** | 100 MB | **+100 MB** |
+| **kata-qemu** | 100 MB | **+100 MB** |
+
+### Analysis
+
+**Kata does NOT isolate disk space.** Both runc and kata consume host disk 1:1 for rootfs writes. This is because the container rootfs is shared via virtio-fs from the host's overlay filesystem.
+
+---
+
+## Test 11: Dentry / Inode Cache (Slab Memory)
+
+### Scenario
+
+Every file access (open, stat, readdir) creates dentry and inode cache entries in the kernel's slab allocator. A pod doing heavy filesystem operations grows the host kernel's slab memory.
+
+### Setup
+
+- **runc and kata-qemu pods** each create and stat 10,000 files on `/tmp`
+- **Measurement:** `cat /proc/slabinfo | grep -E "dentry|ext4_inode"` on the node before and after
+
+### Results
+
+| Slab object | Baseline | After runc (+delta) | After kata (+delta) |
+|------------|----------|--------------------|--------------------|
+| **dentry** | 159,600 | 189,597 (**+29,997**) | 209,639 (**+20,042**) |
+| **ext4_inode_cache** | 56,813 | 66,825 (**+10,012**) | 76,815 (**+9,990**) |
+
+### Analysis
+
+**Kata does NOT isolate dentry/inode cache.** Both runc and kata grow the host kernel's slab caches. This is because virtio-fs serves files from the host filesystem — the host kernel creates dentry and inode cache entries to serve each file request from the guest, even though the guest also maintains its own caches.
+
+---
+
 ## Summary
 
 ### Isolation Properties: runc vs Kata
@@ -364,6 +460,10 @@ With runc, inotify watches are in the host kernel. A pod creating 1,000 watches 
 | **Filesystem inodes (LVM PVC)** | Isolated (per-PVC filesystem) | Isolated (per-PVC filesystem) |
 | **File descriptors** | **Shared host kernel** | Isolated (per-VM kernel) |
 | **Inotify watches** | **Shared host kernel** | Isolated (per-VM kernel) |
+| **Inotify instances** | **Shared host kernel** | Isolated (per-VM kernel) |
+| **ARP / neighbour table** | Isolated (per-pod netns) | Isolated (per-VM netns) |
+| **Disk space** | **Shared host filesystem** | **Shared via virtio-fs** |
+| **Dentry / inode cache (slab)** | **Shared host kernel** | **Shared via virtio-fs** |
 | **Process table (PIDs)** | **Shared host kernel** | Isolated (per-VM kernel) |
 | **Kernel scheduler** | **Shared** | Isolated |
 | **Kernel memory (slab, page tables)** | **Shared** | Isolated |

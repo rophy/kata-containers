@@ -194,14 +194,14 @@ sysctl fs.inotify
 
 ## Summary Table
 
-| # | Resource | Kernel limit | Cgroup protection | Expected kata isolation |
-|---|----------|-------------|-------------------|------------------------|
-| 6 | File descriptors | `fs.file-max` | None | Yes |
-| 7 | Inotify watches | `fs.inotify.max_user_watches` | None | Yes |
-| 8 | Inotify instances | `fs.inotify.max_user_instances` | None | Yes |
-| 9 | ARP table | `neigh/default/gc_thresh3` | None | TBD (may be per-netns) |
-| 10 | Mount points | soft (memory) | None | Partial |
-| 11 | Disk space | filesystem size | None (quota only) | No |
-| 12 | Dentry/inode cache | slab memory | memory cgroup (partial) | TBD |
-| 13 | Socket buffer memory | `net.ipv4.tcp_mem` | memory cgroup (partial) | Yes |
-| 14 | Entropy pool | pool size | None | TBD (modern kernels) |
+| # | Resource | Kernel limit | Cgroup protection | Kata isolation | Status |
+|---|----------|-------------|-------------------|----------------|--------|
+| 6 | File descriptors | `fs.file-max` | None | **Yes** | Tested |
+| 7 | Inotify watches | `fs.inotify.max_user_watches` | None | **Yes** | Tested |
+| 8 | Inotify instances | `fs.inotify.max_user_instances` | None | **Yes** | Tested |
+| 9 | ARP table | `neigh/default/gc_thresh3` | None | N/A (per-netns) | Tested |
+| 10 | Mount points | soft (memory) | None | Partial | |
+| 11 | Disk space | filesystem size | None (quota only) | **No** | Tested |
+| 12 | Dentry/inode cache | slab memory | memory cgroup (partial) | **No** (virtio-fs) | Tested |
+| 13 | Socket buffer memory | `net.ipv4.tcp_mem` | memory cgroup (partial) | Yes | |
+| 14 | Entropy pool | pool size | None | TBD (modern kernels) | |
