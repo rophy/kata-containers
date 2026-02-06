@@ -200,17 +200,19 @@ Every file on a filesystem consumes an inode. If a pod creates millions of small
 |--------|------------------------|------------------------|
 | Create 10,000 files on rootfs (`/tmp`) | **+10,002** | **+10,002** |
 | Create 10,000 files on PVC (hostpath) | **+10,000** | **+10,001** |
+| Create 10,000 files on PVC (LVM block device) | **0** | **0** |
 | Create 10,000 files on `/dev/shm` (guest tmpfs) | N/A | **0** |
 
 ### Analysis
 
-**Kata does NOT isolate inodes** for rootfs or PVC writes. Both runc and kata consume host inodes 1:1.
+**Kata does NOT isolate inodes** for rootfs or hostpath PVC writes. Both runc and kata consume host inodes 1:1.
 
 - **Container rootfs:** Shared via virtio-fs from the host's overlay filesystem
 - **PVC (hostpath):** Stored directly on the host filesystem, mounted into kata via virtio-fs
+- **PVC (LVM block device):** Each LVM volume has its own ext4 filesystem with an independent inode pool (16,384 inodes for 64MB). Host inode count is unaffected regardless of runtime. This is CSI-level isolation, not Kata isolation.
 - **Guest-local tmpfs:** Files on `/dev/shm` inside the VM exist only in VM memory and do NOT consume host inodes
 
-The hostpath provisioner stores PVC data directly on the host filesystem, so inodes are consumed on the host regardless of runtime.
+The hostpath provisioner stores PVC data directly on the host filesystem, so inodes are consumed on the host regardless of runtime. Block-device CSI drivers (e.g., OpenEBS LVM LocalPV) provide inode isolation by giving each PVC its own filesystem.
 
 ---
 
@@ -298,6 +300,58 @@ Kata pods see only their VM's virtual hardware. The guest kernel is different, m
 
 ---
 
+## Test 6: File Descriptor Exhaustion
+
+### Scenario
+
+The host kernel maintains a system-wide count of open file descriptors (`/proc/sys/fs/file-nr`). Every file open, socket creation, or pipe in a runc container increments this global counter. If a pod opens enough file descriptors, it can exhaust the system-wide limit, causing "too many open files" errors for all processes on the node.
+
+### Setup
+
+- **runc and kata-qemu pods** each open 10,000 file descriptors (`/dev/null`)
+- **Measurement:** `cat /proc/sys/fs/file-nr` on the node before and after
+
+### Results
+
+| Client | FDs opened | Host file-nr delta |
+|--------|-----------|-------------------|
+| **runc** | 10,000 | **+10,176** |
+| **kata-qemu** | 10,000 | **+608** (kubectl exec overhead) |
+
+### Analysis
+
+**Kata isolates file descriptors.** File descriptors opened inside a kata pod exist in the guest kernel and do not consume host file descriptors. The small host delta (~608) during the kata test is from the `kubectl exec` session itself, not from the 10,000 fds opened inside the VM.
+
+With runc, all file descriptors are in the host kernel. A pod opening 10,000 fds causes a 1:1 increase in the host's global fd count.
+
+---
+
+## Test 7: Inotify Watch Exhaustion
+
+### Scenario
+
+The host kernel has a system-wide limit on inotify watches (`/proc/sys/fs/inotify/max_user_watches`, default 1,048,576). Applications using file watchers (node.js dev servers, IDEs, log tailers) create inotify watches. If a pod exhausts the limit, other pods and system services cannot create new watches, resulting in "no space left on device" errors.
+
+### Setup
+
+- **runc and kata-qemu pods** each create 1,000 inotify watches on files in `/tmp`
+- **Measurement:** Count total inotify watches across all host processes via `/proc/*/fdinfo/*`
+
+### Results
+
+| Client | Watches created | Host inotify watch delta |
+|--------|----------------|-------------------------|
+| **runc** | 1,000 | **+998** |
+| **kata-qemu** | 1,000 | **+6** (background noise) |
+
+### Analysis
+
+**Kata isolates inotify watches.** Inotify watches created inside a kata pod exist in the guest kernel and do not consume host inotify watches. The host count remained essentially unchanged (+6 from background fluctuation).
+
+With runc, inotify watches are in the host kernel. A pod creating 1,000 watches causes a 1:1 increase in the host's global watch count.
+
+---
+
 ## Summary
 
 ### Isolation Properties: runc vs Kata
@@ -306,7 +360,10 @@ Kata pods see only their VM's virtual hardware. The guest kernel is different, m
 |----------|---------------|----------------|
 | **Network (TCP ports)** | Isolated (per-pod netns) | Isolated (per-VM netns) |
 | **Conntrack table** | **Shared host kernel** | **Shared host kernel** |
-| **Filesystem inodes** | **Shared host filesystem** | **Shared via virtio-fs** |
+| **Filesystem inodes (hostpath)** | **Shared host filesystem** | **Shared via virtio-fs** |
+| **Filesystem inodes (LVM PVC)** | Isolated (per-PVC filesystem) | Isolated (per-PVC filesystem) |
+| **File descriptors** | **Shared host kernel** | Isolated (per-VM kernel) |
+| **Inotify watches** | **Shared host kernel** | Isolated (per-VM kernel) |
 | **Process table (PIDs)** | **Shared host kernel** | Isolated (per-VM kernel) |
 | **Kernel scheduler** | **Shared** | Isolated |
 | **Kernel memory (slab, page tables)** | **Shared** | Isolated |
