@@ -271,6 +271,125 @@ multipass exec microk8s-crio -- uname -r
 
 The pod kernel (e.g., `6.18.5`) should differ from the host kernel (e.g., `6.8.0-90-generic`), confirming the pod runs in a Kata VM.
 
+## Step 14: Install OpenEBS LVM LocalPV CSI (Optional)
+
+OpenEBS LVM LocalPV provides block-based persistent volumes. Each PVC gets its own logical volume with an independent ext4 filesystem and inode pool, unlike hostpath which shares the host filesystem.
+
+### Create LVM Volume Group
+
+Create a sparse file backed LVM volume group on the VM:
+
+```bash
+multipass exec microk8s-crio -- sudo bash -c '
+truncate -s 2G /var/openebs-lvm.img
+losetup /dev/loop10 /var/openebs-lvm.img
+pvcreate /dev/loop10
+vgcreate openebs-vg /dev/loop10
+'
+```
+
+> **Note:** The loop device is lost on VM reboot. To restore it:
+> ```bash
+> multipass exec microk8s-crio -- sudo bash -c '
+> losetup /dev/loop10 /var/openebs-lvm.img
+> vgchange -ay openebs-vg
+> '
+> ```
+
+### Install OpenEBS via Helm
+
+Install with only LVM LocalPV enabled (minimal footprint):
+
+```bash
+multipass exec microk8s-crio -- sudo microk8s helm repo add openebs https://openebs.github.io/openebs
+multipass exec microk8s-crio -- sudo microk8s helm repo update openebs
+
+multipass exec microk8s-crio -- sudo microk8s helm install openebs openebs/openebs \
+  --namespace openebs --create-namespace \
+  --set engines.local.lvm.enabled=true \
+  --set engines.local.zfs.enabled=false \
+  --set engines.local.rawfile.enabled=false \
+  --set engines.replicated.mayastor.enabled=false \
+  --set loki.enabled=false \
+  --set localpv-provisioner.enabled=false \
+  --set openebs-crds.csi.volumeSnapshots.enabled=false \
+  --set lvm-localpv.lvmNode.kubeletDir=/var/snap/microk8s/common/var/lib/kubelet/ \
+  --set lvm-localpv.lvmPlugin.kubeletDir=/var/snap/microk8s/common/var/lib/kubelet/ \
+  --set lvm-localpv.lvmController.snapshotter.enabled=false \
+  --timeout 300s
+```
+
+> **Important:** The `kubeletDir` override is required because MicroK8s uses `/var/snap/microk8s/common/var/lib/kubelet/` instead of the default `/var/lib/kubelet/`. Without this, PVCs will appear bound but the LVM volume won't actually be mounted into pods.
+
+Wait for pods:
+
+```bash
+multipass exec microk8s-crio -- sudo microk8s kubectl get pods -n openebs
+# Should show: controller (5/5), node (2/2), plus localpv-provisioner and alloy
+```
+
+### Create StorageClass
+
+```bash
+multipass exec microk8s-crio -- sudo microk8s kubectl apply -f - << 'EOF'
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: lvm
+provisioner: local.csi.openebs.io
+parameters:
+  vgPattern: "openebs-vg"
+  fsType: "ext4"
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+EOF
+```
+
+> **Note:** The parameter is `vgPattern`, not `storage`. Using the wrong parameter name results in "missing vg name" errors.
+
+### Verify
+
+```bash
+multipass exec microk8s-crio -- sudo microk8s kubectl apply -f - << 'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-lvm-pvc
+spec:
+  storageClassName: lvm
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-lvm
+spec:
+  containers:
+  - name: test
+    image: busybox
+    command: ["sleep", "3600"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: test-lvm-pvc
+EOF
+
+multipass exec microk8s-crio -- sudo microk8s kubectl wait --for=condition=ready pod/test-lvm --timeout=120s
+
+# Verify /data has its own filesystem (should show ~16K inodes for 64MB, not 3.8M)
+multipass exec microk8s-crio -- sudo microk8s kubectl exec test-lvm -- stat -f /data
+
+# Cleanup
+multipass exec microk8s-crio -- sudo microk8s kubectl delete pod test-lvm
+multipass exec microk8s-crio -- sudo microk8s kubectl delete pvc test-lvm-pvc
+```
+
 ## Available Runtimes
 
 | RuntimeClass | Hypervisor | Config File |
@@ -353,6 +472,9 @@ multipass exec microk8s-crio -- ps aux | grep -E "(qemu|kata|virtiofsd)"
 | Kata shim | `/opt/kata/bin/containerd-shim-kata-v2` |
 | Kata configs | `/opt/kata/share/defaults/kata-containers/` |
 | MicroK8s kubelet args | `/var/snap/microk8s/current/args/kubelet` |
+| MicroK8s kubelet root | `/var/snap/microk8s/common/var/lib/kubelet/` |
+| OpenEBS LVM backing file | `/var/openebs-lvm.img` |
+| OpenEBS LVM volume group | `openebs-vg` |
 
 ## References
 
