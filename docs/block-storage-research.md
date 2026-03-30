@@ -159,13 +159,37 @@ CRI-O has no snapshotter concept (that's containerd-specific). Current options:
 | Shim overlay→block conversion | No | Would be full | Moderate | Reverted blockfile PR was heading here |
 | Switch to containerd | Yes | Full (devmapper) | Minimal | Loses CRI-O simplicity |
 
+## Ceph RBD Test Results (2026-03-30)
+
+Tested with MicroCeph + ceph-csi (rook-ceph-external) on MicroK8s + CRI-O 1.33.10.
+
+### `volumeMode: Filesystem` + `shared_fs=none` = BROKEN
+
+Standard filesystem PVC becomes tmpfs inside the VM. Data is not persisted. The CSI mounts `/dev/rbd0` as a directory on the host, but with `shared_fs=none` the directory can't be shared into the VM.
+
+### `volumeMode: Block` + `shared_fs=none` = WORKS
+
+The Ceph RBD block device (`/dev/rbd0`) is passed directly into the Kata VM via virtio-scsi. Inside the VM it appears as `/dev/sda`. Can be formatted and mounted by the guest kernel. CSI health checks are unaffected because the CSI only manages the block device, not the filesystem.
+
+| Aspect | Result |
+|--------|--------|
+| Block device in VM | `/dev/sda` (64MB, QEMU SCSI) |
+| Format + mount | ext4, successful inside VM |
+| Host inode/disk impact | None |
+| CSI health checks | Unaffected |
+| Data persistence | Confirmed (Ceph RBD backend) |
+
+### Conclusion
+
+`volumeMode: Block` is the viable path for PVC isolation with Kata. See [implementation guide](kata-block-storage-implementation-guide.md) for the full plan using a mutating webhook to make this transparent to applications.
+
 ## Recommendations
 
-**For CRI-O users today:** Use guest pull. It's the only working path and upstream is actively investing in it for CoCo.
+**For CRI-O users today:** Use guest pull for rootfs isolation + `volumeMode: Block` PVCs for data isolation. A mutating webhook can make this transparent to applications.
 
 **For containerd users today:** Devmapper works but has operational pain. Wait for Kata blockfile support ([#7996](https://github.com/kata-containers/kata-containers/issues/7996)) for a simpler option.
 
-**Best long-term bet:** Guest pull stabilizing out of experimental. Upstream CoCo investment drives this. The latency penalty may be mitigated by future image caching inside the guest.
+**Best long-term bet:** `volumeMode: Block` + mutating webhook + Kata agent auto-mount. This is CSI-agnostic, doesn't break CSI health checks, and achieves full disk isolation for both rootfs and PVCs.
 
 ## Key Links
 
