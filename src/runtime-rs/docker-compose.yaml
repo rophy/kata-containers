@@ -1,0 +1,9 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ../..:/workspace
+    working_dir: /workspace/src/runtime-rs
+    command: sleep infinity
