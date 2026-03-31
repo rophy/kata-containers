@@ -1,0 +1,119 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kata-webhook
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kata-block-volume-webhook
+  namespace: kata-webhook
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kata-block-volume-webhook
+rules:
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kata-block-volume-webhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kata-block-volume-webhook
+subjects:
+- kind: ServiceAccount
+  name: kata-block-volume-webhook
+  namespace: kata-webhook
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kata-block-volume-webhook
+  namespace: kata-webhook
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kata-block-volume-webhook
+  template:
+    metadata:
+      labels:
+        app: kata-block-volume-webhook
+    spec:
+      serviceAccountName: kata-block-volume-webhook
+      containers:
+      - name: webhook
+        image: kata-block-volume-webhook:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8443
+        env:
+        - name: TLS_CERT_FILE
+          value: /etc/webhook/certs/tls.crt
+        - name: TLS_KEY_FILE
+          value: /etc/webhook/certs/tls.key
+        volumeMounts:
+        - name: certs
+          mountPath: /etc/webhook/certs
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8443
+            scheme: HTTPS
+          initialDelaySeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8443
+            scheme: HTTPS
+          initialDelaySeconds: 5
+      volumes:
+      - name: certs
+        secret:
+          secretName: kata-block-volume-webhook-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kata-block-volume-webhook
+  namespace: kata-webhook
+spec:
+  selector:
+    app: kata-block-volume-webhook
+  ports:
+  - port: 443
+    targetPort: 8443
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: kata-block-volume-webhook
+webhooks:
+- name: kata-block-volume.kata-webhook.svc
+  admissionReviewVersions: ["v1"]
+  sideEffects: None
+  clientConfig:
+    service:
+      name: kata-block-volume-webhook
+      namespace: kata-webhook
+      path: /mutate
+    caBundle: ${CA_BUNDLE}
+  rules:
+  - apiGroups: [""]
+    apiVersions: ["v1"]
+    resources: ["pods"]
+    operations: ["CREATE"]
+  # Only intercept pods with kata runtime classes
+  objectSelector:
+    matchExpressions:
+    - key: kata-block-volume-webhook
+      operator: DoesNotExist  # Don't re-process already-mutated pods
+  failurePolicy: Ignore  # Don't block pod creation if webhook is down

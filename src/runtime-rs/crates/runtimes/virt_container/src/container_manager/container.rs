@@ -205,6 +205,58 @@ impl Container {
         let devices_agent = annotate_container_devices(&mut spec, container_devices)
             .context("annotate container devices failed")?;
 
+        // Auto-mount block devices that have kata volume annotations.
+        // When a volumeDevice has annotations like:
+        //   io.katacontainers.volume.<dev>.mount_path = "/data"
+        //   io.katacontainers.volume.<dev>.fs_type = "ext4"
+        // the device is automatically formatted (if needed) and mounted at the
+        // specified path inside the container, so applications see a normal
+        // filesystem mount instead of a raw block device.
+        let annotations = spec.annotations().clone().unwrap_or_default();
+        for device in &devices_agent {
+            // container_path is e.g. "/dev/xvda" — derive a key from the device name
+            let dev_name = device
+                .container_path
+                .trim_start_matches("/dev/")
+                .replace('/', "_");
+            let mount_key = format!("io.katacontainers.volume.{}.mount_path", dev_name);
+            let fstype_key = format!("io.katacontainers.volume.{}.fs_type", dev_name);
+
+            if let Some(mount_path) = annotations.get(&mount_key) {
+                let fs_type = annotations
+                    .get(&fstype_key)
+                    .map(|s| s.as_str())
+                    .unwrap_or("ext4");
+
+                info!(
+                    sl!(),
+                    "Auto-mounting block device {} at {} (fsType: {})",
+                    device.container_path,
+                    mount_path,
+                    fs_type
+                );
+
+                let storage = agent::Storage {
+                    driver: device.field_type.clone(),
+                    source: device.id.clone(),
+                    fs_type: fs_type.to_string(),
+                    mount_point: mount_path.clone(),
+                    options: Vec::new(),
+                    ..Default::default()
+                };
+                storages.push(storage);
+
+                // Add an OCI mount entry so the container sees the mount point
+                let mut mount = oci::Mount::default();
+                mount.set_destination(std::path::PathBuf::from(mount_path));
+                mount.set_typ(Some(fs_type.to_string()));
+                mount.set_source(Some(std::path::PathBuf::from(mount_path)));
+                if let Some(ref mut mounts) = spec.mounts_mut() {
+                    mounts.push(mount);
+                }
+            }
+        }
+
         // update vcpus, mems and host cgroups
         let resources = self
             .resource_manager
