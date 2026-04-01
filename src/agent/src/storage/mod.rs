@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -251,6 +252,54 @@ pub(crate) fn new_device(path: String) -> Result<Arc<dyn StorageDevice>> {
     Ok(Arc::new(device))
 }
 
+/// Check if a block device has a filesystem. If not, format it.
+/// This is idempotent: if the device already has a filesystem, it is left untouched.
+fn ensure_filesystem(device: &Path, fstype: &str, logger: &Logger) -> Result<()> {
+    // Check for existing filesystem using blkid
+    let output = Command::new("blkid")
+        .arg(device)
+        .output()
+        .context("failed to run blkid")?;
+
+    if output.status.success() {
+        // Device already has a filesystem
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        info!(logger, "block device already formatted";
+            "device" => device.display(),
+            "blkid" => stdout.trim(),
+        );
+        return Ok(());
+    }
+
+    // blkid exit code 2 means no filesystem found — format it
+    info!(logger, "no filesystem on block device, formatting";
+        "device" => device.display(),
+        "fstype" => fstype,
+    );
+
+    let mkfs_result = Command::new(format!("mkfs.{}", fstype))
+        .arg("-q")
+        .arg(device)
+        .output()
+        .with_context(|| format!("failed to run mkfs.{}", fstype))?;
+
+    if !mkfs_result.status.success() {
+        let stderr = String::from_utf8_lossy(&mkfs_result.stderr);
+        return Err(anyhow!(
+            "mkfs.{} failed on {}: {}",
+            fstype,
+            device.display(),
+            stderr.trim()
+        ));
+    }
+
+    info!(logger, "formatted block device";
+        "device" => device.display(),
+        "fstype" => fstype,
+    );
+    Ok(())
+}
+
 #[instrument]
 pub(crate) fn common_storage_handler(logger: &Logger, storage: &Storage) -> Result<String> {
     mount_storage(logger, storage)?;
@@ -280,6 +329,17 @@ fn mount_storage(logger: &Logger, storage: &Storage) -> Result<()> {
     let src_path = Path::new(&storage.source);
     create_mount_destination(src_path, mount_path, "", &storage.fstype)
         .context("Could not create mountpoint")?;
+
+    // For block devices: format if no filesystem exists yet.
+    // This handles the first-use case for volumeMode: Block PVCs where
+    // the CSI driver attaches the raw block device without formatting.
+    if !storage.fstype.is_empty()
+        && storage.fstype != "bind"
+        && storage.fstype != "tmpfs"
+        && src_path.starts_with("/dev/")
+    {
+        ensure_filesystem(src_path, &storage.fstype, &logger)?;
+    }
 
     info!(logger, "mounting storage";
         "mount-source" => src_path.display(),
