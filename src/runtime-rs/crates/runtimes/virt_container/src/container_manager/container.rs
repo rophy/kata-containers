@@ -236,21 +236,31 @@ impl Container {
                     fs_type
                 );
 
+                // Use a writable sandbox path for the agent-level mount point.
+                // The agent mounts the block device here, then the OCI mount
+                // bind-mounts it into the container at the user-requested path.
+                let sandbox_mount_point = format!(
+                    "/run/kata-containers/shared/containers/{}/kata-vol-{}",
+                    config.container_id, dev_name
+                );
+
                 let storage = agent::Storage {
                     driver: device.field_type.clone(),
                     source: device.id.clone(),
                     fs_type: fs_type.to_string(),
-                    mount_point: mount_path.clone(),
+                    mount_point: sandbox_mount_point.clone(),
                     options: Vec::new(),
                     ..Default::default()
                 };
                 storages.push(storage);
 
-                // Add an OCI mount entry so the container sees the mount point
+                // Add an OCI mount entry to bind-mount from the sandbox path
+                // into the container at the user-requested path.
                 let mut mount = oci::Mount::default();
                 mount.set_destination(std::path::PathBuf::from(mount_path));
-                mount.set_typ(Some(fs_type.to_string()));
-                mount.set_source(Some(std::path::PathBuf::from(mount_path)));
+                mount.set_typ(Some("bind".to_string()));
+                mount.set_source(Some(std::path::PathBuf::from(&sandbox_mount_point)));
+                mount.set_options(Some(vec!["bind".to_string(), "rw".to_string()]));
                 if let Some(ref mut mounts) = spec.mounts_mut() {
                     mounts.push(mount);
                 }
