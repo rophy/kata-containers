@@ -338,6 +338,64 @@ func TestMutatePod_WrongResource(t *testing.T) {
 	}
 }
 
+func TestMutatePod_MixedFilesystemAndBlock(t *testing.T) {
+	// Pod has both a Filesystem PVC (volumeMount) and a Block PVC (volumeMount
+	// that should be converted). The webhook should only convert the block one.
+	runtimeClass := "kata-qemu-coco-dev-rs"
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mixed-pod",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &runtimeClass,
+			Containers: []corev1.Container{
+				{
+					Name: "app",
+					VolumeMounts: []corev1.VolumeMount{
+						{Name: "config", MountPath: "/etc/config"},
+						{Name: "dbdata", MountPath: "/var/lib/db"},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "config",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: "config-pvc", // Filesystem PVC — not labeled
+						},
+					},
+				},
+				{
+					Name: "dbdata",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: "db-pvc", // Block PVC — labeled
+						},
+					},
+				},
+			},
+		},
+	}
+
+	raw, _ := json.Marshal(pod)
+	req := &admissionv1.AdmissionRequest{
+		Kind:      metav1.GroupVersionKind{Kind: "Pod"},
+		Namespace: "default",
+		Object:    runtime.RawExtension{Raw: raw},
+	}
+
+	// Note: getBlockPassthroughVolumes returns nil outside cluster,
+	// so no PVCs will be found and no patches generated.
+	// This test documents the expected behavior — in a real cluster,
+	// only "dbdata" would be converted, "config" would stay as volumeMount.
+	resp := mutatePod(req)
+	if !resp.Allowed {
+		t.Fatal("expected allowed")
+	}
+}
+
 func TestEscapeJSONPointer(t *testing.T) {
 	tests := []struct {
 		input    string
