@@ -210,8 +210,18 @@ func mutatePod(req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse
 		})
 	}
 
-	// Process each container
-	for ci, container := range pod.Spec.Containers {
+	// Process initContainers and containers
+	type containerRef struct {
+		pathPrefix string
+		containers []corev1.Container
+	}
+	containerGroups := []containerRef{
+		{"initContainers", pod.Spec.InitContainers},
+		{"containers", pod.Spec.Containers},
+	}
+
+	for _, group := range containerGroups {
+	for ci, container := range group.containers {
 		var keptMounts []corev1.VolumeMount
 		var newDevices []corev1.VolumeDevice
 		converted := false
@@ -262,7 +272,7 @@ func mutatePod(req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse
 		}
 		patches = append(patches, jsonPatch{
 			Op:    "replace",
-			Path:  fmt.Sprintf("/spec/containers/%d/volumeMounts", ci),
+			Path:  fmt.Sprintf("/spec/%s/%d/volumeMounts", group.pathPrefix, ci),
 			Value: keptMounts,
 		})
 
@@ -272,17 +282,18 @@ func mutatePod(req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse
 		if len(existingDevices) == 0 {
 			patches = append(patches, jsonPatch{
 				Op:    "add",
-				Path:  fmt.Sprintf("/spec/containers/%d/volumeDevices", ci),
+				Path:  fmt.Sprintf("/spec/%s/%d/volumeDevices", group.pathPrefix, ci),
 				Value: allDevices,
 			})
 		} else {
 			patches = append(patches, jsonPatch{
 				Op:    "replace",
-				Path:  fmt.Sprintf("/spec/containers/%d/volumeDevices", ci),
+				Path:  fmt.Sprintf("/spec/%s/%d/volumeDevices", group.pathPrefix, ci),
 				Value: allDevices,
 			})
 		}
 	}
+	} // end containerGroups loop
 
 	if len(patches) == 0 {
 		return allowed()

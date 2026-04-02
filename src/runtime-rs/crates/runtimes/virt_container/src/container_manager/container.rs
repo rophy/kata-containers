@@ -1028,4 +1028,77 @@ mod tests {
             "/var/log"
         );
     }
+
+    #[test]
+    fn test_build_block_automount_device_mapper_path() {
+        // Device paths like /dev/mapper/vg-lv contain slashes after /dev/
+        // The replace('/', '_') should handle this
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "io.katacontainers.volume.mapper_vg-lv.mount_path".to_string(),
+            "/data".to_string(),
+        );
+
+        let devices = vec![agent::types::Device {
+            container_path: "/dev/mapper/vg-lv".to_string(),
+            id: "0000:04:00.0".to_string(),
+            field_type: "blk".to_string(),
+            ..Default::default()
+        }];
+
+        let results = build_block_automount(&annotations, &devices, "ctr-dm");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.fs_type, "ext4", "default fstype");
+        assert!(
+            results[0].0.mount_point.contains("mapper_vg-lv"),
+            "sandbox path should contain sanitized device name: {}",
+            results[0].0.mount_point
+        );
+    }
+
+    #[test]
+    fn test_build_block_automount_empty_devices() {
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "io.katacontainers.volume.xvda.mount_path".to_string(),
+            "/data".to_string(),
+        );
+
+        let devices: Vec<agent::types::Device> = vec![];
+        let results = build_block_automount(&annotations, &devices, "ctr-empty");
+        assert_eq!(results.len(), 0, "no devices → no auto-mount");
+    }
+
+    #[test]
+    fn test_build_block_automount_bind_mount_preserved() {
+        // Verify the OCI mount has correct bind mount options
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "io.katacontainers.volume.sda.mount_path".to_string(),
+            "/mnt/storage".to_string(),
+        );
+
+        let devices = vec![agent::types::Device {
+            container_path: "/dev/sda".to_string(),
+            id: "0000:04:00.0".to_string(),
+            field_type: "scsi".to_string(),
+            ..Default::default()
+        }];
+
+        let results = build_block_automount(&annotations, &devices, "ctr-bind");
+        assert_eq!(results.len(), 1);
+
+        let (storage, mount) = &results[0];
+        // Storage should have the real fstype for the agent to mount
+        assert_eq!(storage.fs_type, "ext4");
+        assert_eq!(storage.driver, "scsi");
+
+        // OCI mount should be a bind mount from sandbox path
+        assert_eq!(mount.typ(), &Some("bind".to_string()));
+        assert!(mount.source().as_ref().unwrap().display().to_string()
+            .starts_with("/run/kata-containers/shared/containers/ctr-bind/"));
+        let opts = mount.options().as_ref().unwrap();
+        assert!(opts.contains(&"bind".to_string()));
+        assert!(opts.contains(&"rw".to_string()));
+    }
 }

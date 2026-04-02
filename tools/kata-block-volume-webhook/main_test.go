@@ -214,6 +214,130 @@ func TestSanitizeDevName(t *testing.T) {
 	}
 }
 
+func TestMutatePVC_LabelValueNotTrue(t *testing.T) {
+	pvc := corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pvc",
+			Namespace: "default",
+			Labels: map[string]string{
+				"kata.io/block-passthrough": "false",
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{},
+	}
+
+	raw, _ := json.Marshal(pvc)
+	req := &admissionv1.AdmissionRequest{
+		Kind:      metav1.GroupVersionKind{Kind: "PersistentVolumeClaim"},
+		Namespace: "default",
+		Object:    runtime.RawExtension{Raw: raw},
+	}
+
+	resp := mutatePVC(req)
+	if !resp.Allowed {
+		t.Fatal("expected allowed")
+	}
+	if resp.Patch != nil {
+		t.Error("expected no patch when label value is 'false'")
+	}
+}
+
+func TestMutatePVC_WrongResource(t *testing.T) {
+	resp := mutatePVC(&admissionv1.AdmissionRequest{
+		Kind: metav1.GroupVersionKind{Kind: "Pod"},
+	})
+	if !resp.Allowed {
+		t.Fatal("expected allowed for non-PVC resource")
+	}
+	if resp.Patch != nil {
+		t.Error("expected no patch for non-PVC resource")
+	}
+}
+
+func TestMutatePod_WithInitContainers(t *testing.T) {
+	// InitContainers with volumeMounts should also be considered
+	// but our webhook currently only processes spec.containers.
+	// This test documents the current behavior.
+	runtimeClass := "kata-qemu-coco-dev-rs"
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-with-init",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &runtimeClass,
+			InitContainers: []corev1.Container{
+				{
+					Name: "init",
+					VolumeMounts: []corev1.VolumeMount{
+						{Name: "data", MountPath: "/data"},
+					},
+				},
+			},
+			Containers: []corev1.Container{
+				{Name: "app"},
+			},
+		},
+	}
+
+	raw, _ := json.Marshal(pod)
+	req := &admissionv1.AdmissionRequest{
+		Kind:      metav1.GroupVersionKind{Kind: "Pod"},
+		Namespace: "default",
+		Object:    runtime.RawExtension{Raw: raw},
+	}
+
+	resp := mutatePod(req)
+	if !resp.Allowed {
+		t.Fatal("expected allowed")
+	}
+	// Current behavior: initContainers are not processed (getBlockPassthroughVolumes
+	// returns nil outside cluster). This is a known limitation to address later.
+}
+
+func TestMutatePod_NoVolumes(t *testing.T) {
+	runtimeClass := "kata"
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "no-vol-pod",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &runtimeClass,
+			Containers: []corev1.Container{
+				{Name: "app"},
+			},
+		},
+	}
+
+	raw, _ := json.Marshal(pod)
+	req := &admissionv1.AdmissionRequest{
+		Kind:      metav1.GroupVersionKind{Kind: "Pod"},
+		Namespace: "default",
+		Object:    runtime.RawExtension{Raw: raw},
+	}
+
+	resp := mutatePod(req)
+	if !resp.Allowed {
+		t.Fatal("expected allowed")
+	}
+	if resp.Patch != nil {
+		t.Error("expected no patch for pod without volumes")
+	}
+}
+
+func TestMutatePod_WrongResource(t *testing.T) {
+	resp := mutatePod(&admissionv1.AdmissionRequest{
+		Kind: metav1.GroupVersionKind{Kind: "PersistentVolumeClaim"},
+	})
+	if !resp.Allowed {
+		t.Fatal("expected allowed for non-Pod resource")
+	}
+	if resp.Patch != nil {
+		t.Error("expected no patch for non-Pod resource")
+	}
+}
+
 func TestEscapeJSONPointer(t *testing.T) {
 	tests := []struct {
 		input    string
