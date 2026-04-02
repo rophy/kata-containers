@@ -231,9 +231,11 @@ func mutatePod(req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse
 				DevicePath: devicePath,
 			})
 
-			// Add auto-mount annotations
-			annoMount := fmt.Sprintf("%s.%s.mount_path", annoPrefix, devName)
-			annoFs := fmt.Sprintf("%s.%s.fs_type", annoPrefix, devName)
+			// Add auto-mount annotations.
+			// Key must match what the shim extracts: device.container_path.trim("/dev/")
+			annoDevName := fmt.Sprintf("kata-vol-%s", devName)
+			annoMount := fmt.Sprintf("%s.%s.mount_path", annoPrefix, annoDevName)
+			annoFs := fmt.Sprintf("%s.%s.fs_type", annoPrefix, annoDevName)
 			patches = append(patches, jsonPatch{
 				Op:    "add",
 				Path:  fmt.Sprintf("/metadata/annotations/%s", escapeJSONPointer(annoMount)),
