@@ -16,6 +16,13 @@ load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
+	# This test requires the patched runtime-rs shim with block auto-mount
+	# annotation support and a patched agent with auto-format (ensure_filesystem).
+	# Skip on hypervisors/runtimes that don't have the patch.
+	[ "${KATA_HYPERVISOR}" == "fc" ] && skip "Firecracker does not support block auto-mount"
+	[ "${KATA_HYPERVISOR}" == "stratovirt" ] && skip "StratoVirt does not support block auto-mount"
+	[ "${KATA_HYPERVISOR}" == "dragonball" ] && skip "Dragonball does not support block auto-mount"
+
 	setup_common || die "setup_common failed"
 
 	node="$(get_one_kata_node)"
@@ -174,6 +181,10 @@ EOF
 }
 
 teardown() {
+	[ "${KATA_HYPERVISOR}" == "fc" ] && skip
+	[ "${KATA_HYPERVISOR}" == "stratovirt" ] && skip
+	[ "${KATA_HYPERVISOR}" == "dragonball" ] && skip
+
 	# Debugging information
 	kubectl describe "pod/$pod_name" 2>/dev/null || true
 
