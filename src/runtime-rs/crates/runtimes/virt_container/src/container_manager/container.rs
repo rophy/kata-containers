@@ -206,64 +206,20 @@ impl Container {
             .context("annotate container devices failed")?;
 
         // Auto-mount block devices that have kata volume annotations.
-        // When a volumeDevice has annotations like:
-        //   io.katacontainers.volume.<dev>.mount_path = "/data"
-        //   io.katacontainers.volume.<dev>.fs_type = "ext4"
-        // the device is automatically formatted (if needed) and mounted at the
-        // specified path inside the container, so applications see a normal
-        // filesystem mount instead of a raw block device.
         let annotations = spec.annotations().clone().unwrap_or_default();
-        for device in &devices_agent {
-            // container_path is e.g. "/dev/xvda" — derive a key from the device name
-            let dev_name = device
-                .container_path
-                .trim_start_matches("/dev/")
-                .replace('/', "_");
-            let mount_key = format!("io.katacontainers.volume.{}.mount_path", dev_name);
-            let fstype_key = format!("io.katacontainers.volume.{}.fs_type", dev_name);
-
-            if let Some(mount_path) = annotations.get(&mount_key) {
-                let fs_type = annotations
-                    .get(&fstype_key)
-                    .map(|s| s.as_str())
-                    .unwrap_or("ext4");
-
-                info!(
-                    sl!(),
-                    "Auto-mounting block device {} at {} (fsType: {})",
-                    device.container_path,
-                    mount_path,
-                    fs_type
-                );
-
-                // Use a writable sandbox path for the agent-level mount point.
-                // The agent mounts the block device here, then the OCI mount
-                // bind-mounts it into the container at the user-requested path.
-                let sandbox_mount_point = format!(
-                    "/run/kata-containers/shared/containers/{}/kata-vol-{}",
-                    config.container_id, dev_name
-                );
-
-                let storage = agent::Storage {
-                    driver: device.field_type.clone(),
-                    source: device.id.clone(),
-                    fs_type: fs_type.to_string(),
-                    mount_point: sandbox_mount_point.clone(),
-                    options: Vec::new(),
-                    ..Default::default()
-                };
-                storages.push(storage);
-
-                // Add an OCI mount entry to bind-mount from the sandbox path
-                // into the container at the user-requested path.
-                let mut mount = oci::Mount::default();
-                mount.set_destination(std::path::PathBuf::from(mount_path));
-                mount.set_typ(Some("bind".to_string()));
-                mount.set_source(Some(std::path::PathBuf::from(&sandbox_mount_point)));
-                mount.set_options(Some(vec!["bind".to_string(), "rw".to_string()]));
-                if let Some(ref mut mounts) = spec.mounts_mut() {
-                    mounts.push(mount);
-                }
+        let automounts =
+            build_block_automount(&annotations, &devices_agent, &config.container_id);
+        for (storage, mount) in automounts {
+            info!(
+                sl!(),
+                "Auto-mounting block device: source={} mount_point={} fs_type={}",
+                storage.source,
+                storage.mount_point,
+                storage.fs_type
+            );
+            storages.push(storage);
+            if let Some(ref mut mounts) = spec.mounts_mut() {
+                mounts.push(mount);
             }
         }
 
@@ -774,9 +730,60 @@ fn is_pid_namespace_enabled(spec: &oci::Spec) -> bool {
     false
 }
 
+/// Parse auto-mount annotations for block volumeDevices.
+/// Returns a list of (Storage, OCI Mount) pairs for devices that have annotations.
+fn build_block_automount(
+    annotations: &HashMap<String, String>,
+    devices: &[agent::types::Device],
+    container_id: &str,
+) -> Vec<(agent::Storage, oci::Mount)> {
+    let mut results = Vec::new();
+
+    for device in devices {
+        let dev_name = device
+            .container_path
+            .trim_start_matches("/dev/")
+            .replace('/', "_");
+        let mount_key = format!("io.katacontainers.volume.{}.mount_path", dev_name);
+        let fstype_key = format!("io.katacontainers.volume.{}.fs_type", dev_name);
+
+        if let Some(mount_path) = annotations.get(&mount_key) {
+            let fs_type = annotations
+                .get(&fstype_key)
+                .map(|s| s.as_str())
+                .unwrap_or("ext4");
+
+            let sandbox_mount_point = format!(
+                "/run/kata-containers/shared/containers/{}/kata-vol-{}",
+                container_id, dev_name
+            );
+
+            let storage = agent::Storage {
+                driver: device.field_type.clone(),
+                source: device.id.clone(),
+                fs_type: fs_type.to_string(),
+                mount_point: sandbox_mount_point.clone(),
+                options: Vec::new(),
+                ..Default::default()
+            };
+
+            let mut mount = oci::Mount::default();
+            mount.set_destination(std::path::PathBuf::from(mount_path));
+            mount.set_typ(Some("bind".to_string()));
+            mount.set_source(Some(std::path::PathBuf::from(&sandbox_mount_point)));
+            mount.set_options(Some(vec!["bind".to_string(), "rw".to_string()]));
+
+            results.push((storage, mount));
+        }
+    }
+
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::amend_spec;
+    use super::build_block_automount;
     use super::is_pid_namespace_enabled;
     use super::*;
     use oci_spec::runtime::LinuxNamespaceType;
@@ -901,5 +908,124 @@ mod tests {
                 d.desc
             );
         }
+    }
+
+    #[test]
+    fn test_build_block_automount_with_annotations() {
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "io.katacontainers.volume.kata-vol-pgdata.mount_path".to_string(),
+            "/var/lib/postgresql/data".to_string(),
+        );
+        annotations.insert(
+            "io.katacontainers.volume.kata-vol-pgdata.fs_type".to_string(),
+            "xfs".to_string(),
+        );
+
+        let devices = vec![agent::types::Device {
+            container_path: "/dev/kata-vol-pgdata".to_string(),
+            id: "0000:04:00.0".to_string(),
+            field_type: "blk".to_string(),
+            ..Default::default()
+        }];
+
+        let results = build_block_automount(&annotations, &devices, "ctr-123");
+        assert_eq!(results.len(), 1);
+
+        let (storage, mount) = &results[0];
+        assert_eq!(storage.driver, "blk");
+        assert_eq!(storage.source, "0000:04:00.0");
+        assert_eq!(storage.fs_type, "xfs");
+        assert_eq!(
+            storage.mount_point,
+            "/run/kata-containers/shared/containers/ctr-123/kata-vol-kata-vol-pgdata"
+        );
+
+        assert_eq!(
+            mount.destination().display().to_string(),
+            "/var/lib/postgresql/data"
+        );
+        assert_eq!(mount.typ(), &Some("bind".to_string()));
+    }
+
+    #[test]
+    fn test_build_block_automount_no_annotations() {
+        let annotations = HashMap::new();
+        let devices = vec![agent::types::Device {
+            container_path: "/dev/xvda".to_string(),
+            id: "0000:05:00.0".to_string(),
+            field_type: "blk".to_string(),
+            ..Default::default()
+        }];
+
+        let results = build_block_automount(&annotations, &devices, "ctr-456");
+        assert_eq!(results.len(), 0, "no annotations → no auto-mount");
+    }
+
+    #[test]
+    fn test_build_block_automount_default_fstype() {
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "io.katacontainers.volume.xvda.mount_path".to_string(),
+            "/data".to_string(),
+        );
+        // No fs_type annotation — should default to ext4
+
+        let devices = vec![agent::types::Device {
+            container_path: "/dev/xvda".to_string(),
+            id: "0000:06:00.0".to_string(),
+            field_type: "scsi".to_string(),
+            ..Default::default()
+        }];
+
+        let results = build_block_automount(&annotations, &devices, "ctr-789");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.fs_type, "ext4", "default fs_type should be ext4");
+    }
+
+    #[test]
+    fn test_build_block_automount_multiple_devices() {
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "io.katacontainers.volume.kata-vol-data.mount_path".to_string(),
+            "/data".to_string(),
+        );
+        annotations.insert(
+            "io.katacontainers.volume.kata-vol-logs.mount_path".to_string(),
+            "/var/log".to_string(),
+        );
+
+        let devices = vec![
+            agent::types::Device {
+                container_path: "/dev/kata-vol-data".to_string(),
+                id: "0000:04:00.0".to_string(),
+                field_type: "blk".to_string(),
+                ..Default::default()
+            },
+            agent::types::Device {
+                container_path: "/dev/kata-vol-logs".to_string(),
+                id: "0000:05:00.0".to_string(),
+                field_type: "blk".to_string(),
+                ..Default::default()
+            },
+            agent::types::Device {
+                // This device has no annotation — should not be auto-mounted
+                container_path: "/dev/raw-disk".to_string(),
+                id: "0000:06:00.0".to_string(),
+                field_type: "blk".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let results = build_block_automount(&annotations, &devices, "ctr-multi");
+        assert_eq!(results.len(), 2, "only annotated devices get auto-mounted");
+        assert_eq!(
+            results[0].1.destination().display().to_string(),
+            "/data"
+        );
+        assert_eq!(
+            results[1].1.destination().display().to_string(),
+            "/var/log"
+        );
     }
 }

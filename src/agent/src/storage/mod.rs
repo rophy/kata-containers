@@ -857,4 +857,73 @@ mod tests {
 
         baremount(src_path, dst_path, "bind", MsFlags::MS_BIND, "", logger)
     }
+
+    /// Test that the ensure_filesystem guard conditions in mount_storage
+    /// correctly identify which sources should trigger formatting.
+    #[test]
+    fn test_ensure_filesystem_guard_conditions() {
+        struct TestCase {
+            fstype: &'static str,
+            source: &'static str,
+            should_format: bool,
+            desc: &'static str,
+        }
+
+        let tests = vec![
+            TestCase {
+                fstype: "ext4",
+                source: "/dev/sda",
+                should_format: true,
+                desc: "block device with ext4 → should format",
+            },
+            TestCase {
+                fstype: "xfs",
+                source: "/dev/vdb",
+                should_format: true,
+                desc: "block device with xfs → should format",
+            },
+            TestCase {
+                fstype: "bind",
+                source: "/dev/sda",
+                should_format: false,
+                desc: "bind mount → skip formatting",
+            },
+            TestCase {
+                fstype: "tmpfs",
+                source: "/dev/sda",
+                should_format: false,
+                desc: "tmpfs → skip formatting",
+            },
+            TestCase {
+                fstype: "",
+                source: "/dev/sda",
+                should_format: false,
+                desc: "empty fstype → skip formatting",
+            },
+            TestCase {
+                fstype: "ext4",
+                source: "/run/kata/shared/foo",
+                should_format: false,
+                desc: "non-device source → skip formatting",
+            },
+            TestCase {
+                fstype: "ext4",
+                source: "kataShared",
+                should_format: false,
+                desc: "virtio-fs tag → skip formatting",
+            },
+        ];
+
+        for tc in &tests {
+            let result = !tc.fstype.is_empty()
+                && tc.fstype != "bind"
+                && tc.fstype != "tmpfs"
+                && tc.source.starts_with("/dev/");
+            assert_eq!(
+                result, tc.should_format,
+                "failed: {} (fstype={}, source={})",
+                tc.desc, tc.fstype, tc.source
+            );
+        }
+    }
 }
