@@ -18,6 +18,9 @@ rules:
 - apiGroups: [""]
   resources: ["persistentvolumeclaims"]
   verbs: ["get", "list"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -92,28 +95,50 @@ spec:
   - port: 443
     targetPort: 8443
 ---
+# PVC webhook: mutate volumeMode for PVCs with kata.io/block-passthrough label
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
-  name: kata-block-volume-webhook
+  name: kata-block-volume-pvc
 webhooks:
-- name: kata-block-volume.kata-webhook.svc
+- name: pvc.kata-block-volume.io
   admissionReviewVersions: ["v1"]
   sideEffects: None
   clientConfig:
     service:
       name: kata-block-volume-webhook
       namespace: kata-webhook
-      path: /mutate
+      path: /mutate-pvc
+    caBundle: ${CA_BUNDLE}
+  rules:
+  - apiGroups: [""]
+    apiVersions: ["v1"]
+    resources: ["persistentvolumeclaims"]
+    operations: ["CREATE"]
+  # Only trigger for PVCs with the block-passthrough label
+  objectSelector:
+    matchLabels:
+      kata.io/block-passthrough: "true"
+  failurePolicy: Ignore
+---
+# Pod webhook: convert volumeMounts to volumeDevices for Kata pods
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: kata-block-volume-pod
+webhooks:
+- name: pod.kata-block-volume.io
+  admissionReviewVersions: ["v1"]
+  sideEffects: None
+  clientConfig:
+    service:
+      name: kata-block-volume-webhook
+      namespace: kata-webhook
+      path: /mutate-pod
     caBundle: ${CA_BUNDLE}
   rules:
   - apiGroups: [""]
     apiVersions: ["v1"]
     resources: ["pods"]
     operations: ["CREATE"]
-  # Only intercept pods with kata runtime classes
-  objectSelector:
-    matchExpressions:
-    - key: kata-block-volume-webhook
-      operator: DoesNotExist  # Don't re-process already-mutated pods
-  failurePolicy: Ignore  # Don't block pod creation if webhook is down
+  failurePolicy: Ignore
