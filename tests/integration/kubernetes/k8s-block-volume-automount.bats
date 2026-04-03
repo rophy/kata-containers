@@ -16,9 +16,6 @@ load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
-	# This test requires the patched runtime-rs shim with block auto-mount
-	# annotation support and a patched agent with auto-format (ensure_filesystem).
-	# Skip on hypervisors/runtimes that don't have the patch.
 	[ "${KATA_HYPERVISOR}" == "fc" ] && skip "Firecracker does not support block auto-mount"
 	[ "${KATA_HYPERVISOR}" == "stratovirt" ] && skip "StratoVirt does not support block auto-mount"
 	[ "${KATA_HYPERVISOR}" == "dragonball" ] && skip "Dragonball does not support block auto-mount"
@@ -26,38 +23,68 @@ setup() {
 	setup_common || die "setup_common failed"
 
 	node="$(get_one_kata_node)"
-	pod_name="pod-block-automount"
-	volume_name="block-automount-pv"
-	volume_claim="block-automount-pvc"
 	vol_capacity="100M"
 	ctr_dev_path="/dev/kata-vol-data"
 	ctr_mount_path="/data"
+}
 
-	# Create loop device for block storage
+create_block_pv_pvc() {
+	local pv_name="$1"
+	local pvc_name="$2"
+
 	tmp_disk_image=$(exec_host "$node" mktemp --tmpdir disk.XXXXXX.img)
 	exec_host "$node" truncate "$tmp_disk_image" --size "$vol_capacity"
 	loop_dev=$(exec_host "$node" sudo losetup -f)
 	exec_host "$node" sudo losetup "$loop_dev" "$tmp_disk_image"
-}
 
-@test "Block volume auto-mount: fresh device is formatted and mounted" {
-	# Create storage class and PV/PVC
-	kubectl create -f volume/local-storage.yaml
+	kubectl create -f volume/local-storage.yaml 2>/dev/null || true
+
+	local node_name
+	node_name="$(kubectl get node -o name | head -1)"
 
 	tmp_pv_yaml=$(mktemp --tmpdir block_pv.XXXXX.yaml)
-	sed -e "s|LOOP_DEVICE|${loop_dev}|" volume/block-loop-pv.yaml > "$tmp_pv_yaml"
-	node_name="$(kubectl get node -o name)"
-	sed -i "s|HOSTNAME|${node_name##node/}|" "$tmp_pv_yaml"
-	sed -i "s|CAPACITY|${vol_capacity}|" "$tmp_pv_yaml"
-	sed -i "s|block-loop-pv|${volume_name}|" "$tmp_pv_yaml"
+	sed -e "s|LOOP_DEVICE|${loop_dev}|" \
+	    -e "s|HOSTNAME|${node_name##node/}|" \
+	    -e "s|CAPACITY|${vol_capacity}|" \
+	    -e "s|block-loop-pv|${pv_name}|" \
+	    volume/block-loop-pv.yaml > "$tmp_pv_yaml"
 	kubectl create -f "$tmp_pv_yaml"
-	cmd="kubectl get pv/${volume_name} | grep Available"
-	waitForProcess "$wait_time" "$sleep_time" "$cmd"
 
 	tmp_pvc_yaml=$(mktemp --tmpdir block_pvc.XXXXX.yaml)
-	sed -e "s|CAPACITY|${vol_capacity}|" volume/block-loop-pvc.yaml > "$tmp_pvc_yaml"
-	sed -i "s|block-loop-pvc|${volume_claim}|" "$tmp_pvc_yaml"
+	sed -e "s|CAPACITY|${vol_capacity}|" \
+	    -e "s|block-loop-pvc|${pvc_name}|" \
+	    volume/block-loop-pvc.yaml > "$tmp_pvc_yaml"
 	kubectl create -f "$tmp_pvc_yaml"
+}
+
+cleanup_block_pv_pvc() {
+	local pv_name="$1"
+	local pvc_name="$2"
+
+	kubectl delete pod --all --force 2>/dev/null || true
+	kubectl delete pvc "$pvc_name" 2>/dev/null || true
+	kubectl delete pv "$pv_name" 2>/dev/null || true
+	kubectl delete storageclass local-storage 2>/dev/null || true
+
+	if [ -n "${loop_dev:-}" ]; then
+		exec_host "$node" sudo losetup -d "$loop_dev" 2>/dev/null || true
+	fi
+	if [ -n "${tmp_disk_image:-}" ]; then
+		exec_host "$node" rm -f "$tmp_disk_image" 2>/dev/null || true
+	fi
+	rm -f "${tmp_pv_yaml:-}" "${tmp_pvc_yaml:-}"
+}
+
+@test "Block volume auto-mount: fresh device is formatted, mounted, and persists across restart" {
+	local pv_name="block-automount-pv"
+	local pvc_name="block-automount-pvc"
+	local pod_name="pod-block-automount"
+
+	create_block_pv_pvc "$pv_name" "$pvc_name"
+
+	# Wait for PV to be available
+	cmd="kubectl get pv/${pv_name} | grep Available"
+	waitForProcess "$wait_time" "$sleep_time" "$cmd"
 
 	# Create pod with auto-mount annotations
 	cat <<EOF | kubectl apply -f -
@@ -80,37 +107,30 @@ spec:
   volumes:
   - name: data
     persistentVolumeClaim:
-      claimName: ${volume_claim}
+      claimName: ${pvc_name}
 EOF
 
 	kubectl wait --for=condition=ready --timeout=$timeout "pod/${pod_name}"
 
-	# Verify the block device is mounted as a filesystem at the requested path
+	# Verify auto-mount: block device mounted as ext4 at /data
 	mount_output=$(kubectl exec "$pod_name" -- mount)
 	echo "$mount_output" | grep "$ctr_mount_path"
 
-	# Verify it's a real filesystem (ext4), not tmpfs
 	mount_type=$(kubectl exec "$pod_name" -- sh -c "mount | grep '$ctr_mount_path' | awk '{print \$5}'")
 	[ "$mount_type" = "ext4" ]
 
-	# Verify read/write works
+	# Verify read/write
 	kubectl exec "$pod_name" -- sh -c "echo auto-mount-test > ${ctr_mount_path}/test.txt"
 	result=$(kubectl exec "$pod_name" -- cat "${ctr_mount_path}/test.txt")
 	[ "$result" = "auto-mount-test" ]
 
-	# Verify it has its own inode pool (not host filesystem)
+	# Verify it has its own inode pool (not host)
 	inode_total=$(kubectl exec "$pod_name" -- sh -c "df -i ${ctr_mount_path} | tail -1 | awk '{print \$2}'")
-	[ "$inode_total" -lt 100000 ] # Block device has small inode count, not host's millions
-}
+	[ "$inode_total" -lt 100000 ]
 
-@test "Block volume auto-mount: data persists across pod restart" {
-	# Write data in first pod
-	kubectl exec "$pod_name" -- sh -c "echo persistent-data > ${ctr_mount_path}/persist.txt"
-
-	# Delete pod
+	# --- Persistence test: delete pod, recreate, verify data ---
 	kubectl delete pod "$pod_name" --wait=true
 
-	# Recreate pod with same PVC
 	cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Pod
@@ -131,26 +151,34 @@ spec:
   volumes:
   - name: data
     persistentVolumeClaim:
-      claimName: ${volume_claim}
+      claimName: ${pvc_name}
 EOF
 
 	kubectl wait --for=condition=ready --timeout=$timeout "pod/${pod_name}"
 
-	# Verify data persisted — agent should NOT reformat (blkid detects existing fs)
-	result=$(kubectl exec "$pod_name" -- cat "${ctr_mount_path}/persist.txt")
-	[ "$result" = "persistent-data" ]
+	# Data should persist (agent detects existing filesystem, skips mkfs)
+	result=$(kubectl exec "$pod_name" -- cat "${ctr_mount_path}/test.txt")
+	[ "$result" = "auto-mount-test" ]
+
+	cleanup_block_pv_pvc "$pv_name" "$pvc_name"
 }
 
 @test "Block volume auto-mount: no annotation means raw block passthrough" {
-	# Delete the annotated pod
-	kubectl delete pod "$pod_name" --wait=true
+	local pv_name="block-raw-pv"
+	local pvc_name="block-raw-pvc"
+	local pod_name="pod-block-raw"
 
-	# Create pod WITHOUT auto-mount annotations — should get raw block device
+	create_block_pv_pvc "$pv_name" "$pvc_name"
+
+	cmd="kubectl get pv/${pv_name} | grep Available"
+	waitForProcess "$wait_time" "$sleep_time" "$cmd"
+
+	# Create pod WITHOUT auto-mount annotations
 	cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Pod
 metadata:
-  name: ${pod_name}-raw
+  name: ${pod_name}
 spec:
   runtimeClassName: kata
   containers:
@@ -163,21 +191,20 @@ spec:
   volumes:
   - name: data
     persistentVolumeClaim:
-      claimName: ${volume_claim}
+      claimName: ${pvc_name}
 EOF
 
-	kubectl wait --for=condition=ready --timeout=$timeout "pod/${pod_name}-raw"
+	kubectl wait --for=condition=ready --timeout=$timeout "pod/${pod_name}"
 
-	# The device should exist but NOT be auto-mounted
-	kubectl exec "${pod_name}-raw" -- ls -la "$ctr_dev_path"
+	# Device should exist but NOT be auto-mounted
+	kubectl exec "$pod_name" -- ls -la "$ctr_dev_path"
 
-	# No mount at /data
-	mount_output=$(kubectl exec "${pod_name}-raw" -- mount)
+	mount_output=$(kubectl exec "$pod_name" -- mount)
 	if echo "$mount_output" | grep -q "$ctr_mount_path"; then
-		fail "Expected no auto-mount without annotations, but found mount at $ctr_mount_path"
+		fail "Expected no auto-mount without annotations"
 	fi
 
-	kubectl delete pod "${pod_name}-raw" --wait=true
+	cleanup_block_pv_pvc "$pv_name" "$pvc_name"
 }
 
 teardown() {
@@ -185,22 +212,6 @@ teardown() {
 	[ "${KATA_HYPERVISOR}" == "stratovirt" ] && skip
 	[ "${KATA_HYPERVISOR}" == "dragonball" ] && skip
 
-	# Debugging information
-	kubectl describe "pod/$pod_name" 2>/dev/null || true
-
-	# Delete k8s resources
-	kubectl delete pod "$pod_name" 2>/dev/null || true
-	kubectl delete pod "${pod_name}-raw" 2>/dev/null || true
-	kubectl delete pvc "$volume_claim" 2>/dev/null || true
-	kubectl delete pv "$volume_name" 2>/dev/null || true
-	kubectl delete storageclass local-storage 2>/dev/null || true
-
-	# Delete temporary yaml files
-	rm -f "$tmp_pv_yaml" "$tmp_pvc_yaml"
-
-	# Remove loop device
-	exec_host "$node" sudo losetup -d "$loop_dev" 2>/dev/null || true
-	exec_host "$node" rm -f "$tmp_disk_image" 2>/dev/null || true
-
+	kubectl describe pod 2>/dev/null || true
 	teardown_common "${node}" "${node_start_time:-}"
 }
