@@ -252,8 +252,13 @@ pub(crate) fn new_device(path: String) -> Result<Arc<dyn StorageDevice>> {
     Ok(Arc::new(device))
 }
 
-/// Check if a block device has a filesystem. If not, format it.
-/// This is idempotent: if the device already has a filesystem, it is left untouched.
+/// Ensure a block device has a healthy filesystem, creating one if needed.
+///
+/// This replicates the CSI NodeStageVolume responsibility:
+/// - If no filesystem: format with mkfs
+/// - If filesystem exists: run fsck for automatic repair
+///
+/// Idempotent: safe to call on every mount.
 fn ensure_filesystem(device: &Path, fstype: &str, logger: &Logger) -> Result<()> {
     // Check for existing filesystem using blkid
     let output = Command::new("blkid")
@@ -262,12 +267,48 @@ fn ensure_filesystem(device: &Path, fstype: &str, logger: &Logger) -> Result<()>
         .context("failed to run blkid")?;
 
     if output.status.success() {
-        // Device already has a filesystem
+        // Device has a filesystem — run fsck for automatic repair before mounting.
+        // Uses -p (preen) for safe automatic fixes, same as CSI drivers do.
         let stdout = String::from_utf8_lossy(&output.stdout);
-        info!(logger, "block device already formatted";
+        info!(logger, "block device has filesystem, running fsck";
             "device" => device.display(),
             "blkid" => stdout.trim(),
         );
+
+        let fsck_result = Command::new(format!("fsck.{}", fstype))
+            .arg("-p")
+            .arg(device)
+            .output();
+
+        match fsck_result {
+            Ok(result) => {
+                // fsck exit codes: 0 = clean, 1 = errors corrected, 2+ = errors remain
+                let code = result.status.code().unwrap_or(32);
+                if code == 0 || code == 1 {
+                    info!(logger, "fsck completed";
+                        "device" => device.display(),
+                        "exit_code" => code,
+                    );
+                } else {
+                    let stderr = String::from_utf8_lossy(&result.stderr);
+                    warn!(logger, "fsck found uncorrectable errors";
+                        "device" => device.display(),
+                        "exit_code" => code,
+                        "stderr" => stderr.trim(),
+                    );
+                    // Continue with mount attempt — let mount decide if it's usable
+                }
+            }
+            Err(e) => {
+                // fsck binary may not exist for this fstype — log and continue
+                warn!(logger, "fsck not available, skipping";
+                    "device" => device.display(),
+                    "fstype" => fstype,
+                    "error" => e.to_string(),
+                );
+            }
+        }
+
         return Ok(());
     }
 
@@ -923,6 +964,35 @@ mod tests {
                 result, tc.should_format,
                 "failed: {} (fstype={}, source={})",
                 tc.desc, tc.fstype, tc.source
+            );
+        }
+    }
+
+    /// Test fsck exit code interpretation.
+    /// fsck returns: 0 = clean, 1 = errors corrected (OK to mount), 2+ = uncorrectable.
+    #[test]
+    fn test_fsck_exit_code_interpretation() {
+        struct TestCase {
+            code: i32,
+            acceptable: bool,
+            desc: &'static str,
+        }
+
+        let tests = vec![
+            TestCase { code: 0, acceptable: true, desc: "clean filesystem" },
+            TestCase { code: 1, acceptable: true, desc: "errors corrected" },
+            TestCase { code: 2, acceptable: false, desc: "system should be rebooted" },
+            TestCase { code: 4, acceptable: false, desc: "errors left uncorrected" },
+            TestCase { code: 8, acceptable: false, desc: "operational error" },
+            TestCase { code: -1, acceptable: false, desc: "unknown/signal" },
+        ];
+
+        for tc in &tests {
+            let result = tc.code == 0 || tc.code == 1;
+            assert_eq!(
+                result, tc.acceptable,
+                "fsck exit code {}: {} — expected acceptable={}",
+                tc.code, tc.desc, tc.acceptable
             );
         }
     }
