@@ -239,34 +239,34 @@ Tested 2026-03-30 on MicroK8s + CRI-O 1.33.10 + MicroCeph + Kata 3.26.0 (qemu-co
 
 ## Implementation Phases
 
-### Phase 1: Manual Validation (current)
+### Phase 1: Manual Validation (done)
 
-What we have today, working end-to-end:
 - [x] `shared_fs=none` + `force_guest_pull` for rootfs isolation
 - [x] `volumeMode: Block` PVC with Ceph RBD CSI
 - [x] Block device passed to Kata VM via virtio-scsi
 - [x] Manual format + mount inside VM (privileged container)
 - [x] Data persistence verified
 
-### Phase 2: Agent Auto-Mount
+### Phase 2: Agent Auto-Mount (done)
 
-Enhance the Kata agent to automatically format and mount block devices:
-- [ ] Detect `volumeDevice` mounts with Kata annotations
-- [ ] Auto-format on first use (idempotent)
-- [ ] Auto-mount at specified path
-- [ ] Container sees a normal filesystem mount — no privileged required
-- [ ] Test with PostgreSQL or MySQL container image
+- [x] Shim patch: detect `volumeDevice` with Kata annotations, create Storage object
+- [x] Agent patch: auto-format on first use (blkid + mkfs, idempotent)
+- [x] Auto-mount at specified path via sandbox-level mount + OCI bind mount
+- [x] Container sees a normal filesystem mount — no privileged required
+- [x] Tested with PostgreSQL 16 on Ceph RBD — data persists across pod restarts
 
-### Phase 3: Mutating Webhook
+### Phase 3: Mutating Webhook (done)
 
-Build and deploy the webhook:
-- [ ] Intercept pods with Kata RuntimeClass
-- [ ] Translate `volumeMounts` → `volumeDevices` for block PVCs
-- [ ] Add fsType and mountPath annotations
-- [ ] Leave non-PVC mounts unchanged
-- [ ] Test with standard database Helm charts (PostgreSQL, MySQL)
+- [x] PVC webhook: mutate `volumeMode: Filesystem` → `Block` for PVCs with `kata.io/block-passthrough` label
+- [x] Pod webhook: translate `volumeMounts` → `volumeDevices` for block PVCs on Kata RuntimeClass pods
+- [x] Add fsType and mountPath annotations automatically
+- [x] Leave non-PVC mounts (ConfigMaps, Secrets, emptyDir) unchanged
+- [x] Handles initContainers
+- [x] Tested with standard PostgreSQL manifest — no manual volumeDevices/annotations needed
+- [x] 21 unit tests (7 shim, 1 agent, 13 webhook) — all passing
+- [x] BATS integration tests: 23/24 passing on k3s + CRI-O
 
-### Phase 4: Production Hardening
+### Phase 4: Production Hardening (next)
 
 - [ ] Filesystem recovery (fsck on unclean shutdown)
 - [ ] Volume expansion (resize block device + resize2fs inside VM)
@@ -274,6 +274,7 @@ Build and deploy the webhook:
 - [ ] Performance benchmarking (fio: direct block vs virtio-fs)
 - [ ] Multi-node testing
 - [ ] Document operational procedures (backup, restore, migration)
+- [ ] Upstream contribution: PR for test fixes, then block storage feature
 
 ## Open Questions
 
