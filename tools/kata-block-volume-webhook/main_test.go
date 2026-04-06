@@ -242,6 +242,84 @@ func TestMutatePVC_LabelValueNotTrue(t *testing.T) {
 	}
 }
 
+func TestMutatePVC_ReadWriteMany_Rejected(t *testing.T) {
+	pvc := corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rwx-pvc",
+			Namespace: "default",
+			Labels:    map[string]string{"kata.io/block-passthrough": "true"},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+		},
+	}
+
+	raw, _ := json.Marshal(pvc)
+	req := &admissionv1.AdmissionRequest{
+		Kind:      metav1.GroupVersionKind{Kind: "PersistentVolumeClaim"},
+		Namespace: "default",
+		Object:    runtime.RawExtension{Raw: raw},
+	}
+
+	resp := mutatePVC(req)
+	if resp.Allowed {
+		t.Fatal("expected denied for ReadWriteMany with block-passthrough")
+	}
+}
+
+func TestMutatePVC_ReadOnlyMany_Rejected(t *testing.T) {
+	pvc := corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rox-pvc",
+			Namespace: "default",
+			Labels:    map[string]string{"kata.io/block-passthrough": "true"},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
+		},
+	}
+
+	raw, _ := json.Marshal(pvc)
+	req := &admissionv1.AdmissionRequest{
+		Kind:      metav1.GroupVersionKind{Kind: "PersistentVolumeClaim"},
+		Namespace: "default",
+		Object:    runtime.RawExtension{Raw: raw},
+	}
+
+	resp := mutatePVC(req)
+	if resp.Allowed {
+		t.Fatal("expected denied for ReadOnlyMany with block-passthrough")
+	}
+}
+
+func TestMutatePVC_ReadWriteOnce_Allowed(t *testing.T) {
+	pvc := corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rwo-pvc",
+			Namespace: "default",
+			Labels:    map[string]string{"kata.io/block-passthrough": "true"},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+		},
+	}
+
+	raw, _ := json.Marshal(pvc)
+	req := &admissionv1.AdmissionRequest{
+		Kind:      metav1.GroupVersionKind{Kind: "PersistentVolumeClaim"},
+		Namespace: "default",
+		Object:    runtime.RawExtension{Raw: raw},
+	}
+
+	resp := mutatePVC(req)
+	if !resp.Allowed {
+		t.Fatal("expected allowed for ReadWriteOnce")
+	}
+	if resp.Patch == nil {
+		t.Fatal("expected patch for ReadWriteOnce with block-passthrough label")
+	}
+}
+
 func TestMutatePVC_WrongResource(t *testing.T) {
 	resp := mutatePVC(&admissionv1.AdmissionRequest{
 		Kind: metav1.GroupVersionKind{Kind: "Pod"},

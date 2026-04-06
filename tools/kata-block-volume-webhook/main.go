@@ -128,6 +128,16 @@ func mutatePVC(req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse
 		return allowed()
 	}
 
+	// Block passthrough only supports ReadWriteOnce — reject ReadWriteMany
+	for _, mode := range pvc.Spec.AccessModes {
+		if mode == corev1.ReadWriteMany || mode == corev1.ReadOnlyMany {
+			return denied(fmt.Sprintf(
+				"PVC %s/%s has accessMode %s which is not supported with %s=true. "+
+					"Block device passthrough only supports ReadWriteOnce.",
+				req.Namespace, pvc.Name, mode, labelBlockPassthrough))
+		}
+	}
+
 	// Already Block mode — nothing to do
 	if pvc.Spec.VolumeMode != nil && *pvc.Spec.VolumeMode == corev1.PersistentVolumeBlock {
 		return allowed()
