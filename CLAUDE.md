@@ -1,6 +1,113 @@
 # Kata Containers Development Notes
 
-## Quick Reference
+## Quick Reference — Multipass k3s (primary test environment)
+
+**VM:** `kata-dev` (Multipass, 4 CPU, 8GB RAM, 50GB disk, Ubuntu 24.04)
+**Runtime:** k3s + CRI-O + kata-deploy (qemu-coco-dev, runtime-rs)
+**Kubeconfig:** `/tmp/kata-dev-kubeconfig.yaml`
+
+### Scripts
+
+```bash
+# Provision VM (idempotent, includes k3s + CRI-O + kata-deploy + MicroCeph + ceph-csi)
+./scripts/kata-dev-up.sh            # full setup
+./scripts/kata-dev-up.sh --no-ceph  # skip MicroCeph + ceph-csi
+
+# Run BATS integration tests
+./scripts/kata-dev-test.sh                        # all 39 applicable tests
+./scripts/kata-dev-test.sh k8s-env.bats           # single test
+./scripts/kata-dev-test.sh k8s-env.bats k8s-exec.bats  # multiple tests
+./scripts/kata-dev-test.sh --list                  # list test names
+./scripts/kata-dev-test.sh --setup-only            # prepare workloads_work dir only
+
+# Stop or delete VM
+./scripts/kata-dev-down.sh           # stop (preserves state)
+./scripts/kata-dev-down.sh --delete  # destroy entirely
+```
+
+### Running tests manually
+
+If you need to run tests outside the runner script, use these env vars:
+
+```bash
+export KUBECONFIG=/tmp/kata-dev-kubeconfig.yaml
+export KATA_HYPERVISOR=qemu-coco-dev
+export KUBERNETES=k3s
+export AUTO_GENERATE_POLICY=no
+
+cd tests/integration/kubernetes
+bash setup.sh  # creates runtimeclass_workloads_work/
+bats k8s-env.bats
+```
+
+**Important:** `KATA_HYPERVISOR=qemu-coco-dev` must match the actual runtime config.
+Using `qemu` causes tests that require CPU hotplug or seccomp to fail instead of skip.
+
+### Test exclusions
+
+Tests excluded from the suite (not applicable to single-node k3s + qemu-coco-dev):
+
+| Category | Tests | Reason |
+|----------|-------|--------|
+| Confidential | `k8s-confidential*.bats`, `k8s-sealed-secret.bats`, `k8s-measured-rootfs.bats` | No TEE hardware |
+| NVIDIA | `k8s-nvidia-*.bats` | No GPU |
+| Guest pull | `k8s-guest-pull-image*.bats`, `k8s-empty-image.bats` | Needs nydus/guest-pull config |
+| Policy | `k8s-policy-*.bats` | Needs genpolicy + policy agent |
+| Special setup | `k8s-openvpn.bats`, `k8s-footloose.bats` | Needs extra infra |
+| Host config | `k8s-sandbox-cgroup.bats`, `k8s-sandbox-vcpus-allocation.bats` | Needs specific host cgroup/CPU config |
+
+### Known skips and failures
+
+| Test | Status | Reason |
+|------|--------|--------|
+| `k8s-cpu-ns` | skip | `static_sandbox_resource_mgmt=true` disables CPU hotplug |
+| `k8s-seccomp` | skip | Intermittent on qemu-coco-dev |
+| `k8s-custom-dns` | skip | Known issue [#9663](https://github.com/kata-containers/kata-containers/issues/9663) |
+| `k8s-oom` | fail | Pre-existing, unrelated to our changes |
+| `k8s-port-forward` | skip | Known issue [#1834](https://github.com/kata-containers/runtime/issues/1834) |
+
+### VM components
+
+| Component | Version | Notes |
+|-----------|---------|-------|
+| k3s | v1.34 | `--container-runtime-endpoint unix:///var/run/crio/crio.sock` |
+| CRI-O | v1.33 | apt repo `isv:/cri-o:/stable:/v1.33` |
+| kata-deploy | 3.28.0 | Helm chart, qemu-coco-dev shim |
+| yq | v4.44.5 | mikefarah/yq, installed on **host** and VM |
+| MicroCeph | snap | 3 loop OSD disks (2GB each) |
+| ceph-csi-rbd | 3.16.2 | Helm chart, `ceph-rbd` StorageClass |
+
+### Key paths (inside VM)
+
+| Component | Path |
+|-----------|------|
+| Kata runtime-rs shim | `/opt/kata/runtime-rs/bin/containerd-shim-kata-v2` |
+| qemu-coco-dev config | `/opt/kata/share/defaults/kata-containers/runtimes/qemu-coco-dev/configuration-qemu-coco-dev.toml` |
+| runtime-rs config | `/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-qemu-coco-dev-runtime-rs.toml` |
+| CRI-O kata config | `/etc/crio/crio.conf.d/99-kata-deploy` |
+| CNI config | `/etc/cni/net.d/10-flannel.conflist` (symlink to k3s) |
+
+### Architecture
+
+```
+Host PC
+└─ Multipass VM "kata-dev" (KVM, 8GB RAM, 4 CPU)
+   ├─ /dev/kvm (nested virtualization)
+   ├─ k3s (control plane + worker)
+   ├─ CRI-O (container runtime)
+   ├─ kata-deploy DaemonSet
+   │   └─ qemu-coco-dev runtime (runtime-rs)
+   ├─ MicroCeph (3 OSD, ceph-rbd StorageClass)
+   └─ Kubernetes
+       └─ Pod with runtimeClassName: kata
+           └─ Kata Guest VM (QEMU)
+               └─ Container
+```
+
+---
+
+<details>
+<summary>Legacy: Testing Kata + Dragonball with Minikube</summary>
 
 **kubectl context:** `minikube`
 
@@ -22,12 +129,6 @@ helm install kata-deploy ./tools/packaging/kata-deploy/helm-chart/kata-deploy \
 kubectl --context minikube wait --for=condition=ready pod -l app=kata-deploy -n kube-system --timeout=600s
 ```
 
----
-
-## Testing Kata + Dragonball with Minikube (Nested VM)
-
-This guide describes how to run Kubernetes with Kata Containers and Dragonball hypervisor in a nested VM environment using Minikube.
-
 ### Prerequisites
 
 **Host requirements:**
@@ -38,199 +139,20 @@ This guide describes how to run Kubernetes with Kata Containers and Dragonball h
 
 **Verify nested virtualization:**
 ```bash
-# Check if enabled
 cat /sys/module/kvm_intel/parameters/nested   # Intel
 cat /sys/module/kvm_amd/parameters/nested     # AMD
 # Should return "Y" or "1"
-
-# Enable if needed (Intel)
-sudo modprobe -r kvm_intel
-sudo modprobe kvm_intel nested=1
-
-# Make permanent
-echo "options kvm_intel nested=1" | sudo tee /etc/modprobe.d/kvm-nested.conf
 ```
 
-**Add user to groups:**
-```bash
-sudo usermod -aG kvm,libvirt $USER
-# Log out and back in for changes to take effect
-```
-
-### Step 1: Create Minikube Cluster
+### Create Minikube Cluster
 
 ```bash
-minikube delete 2>/dev/null  # Clean up any existing cluster
-
 minikube start \
   --driver=kvm2 \
   --container-runtime=containerd \
   --memory=8192 \
   --cpus=2 \
   --disk-size=30g
-```
-
-**Important:** 8GB RAM is the minimum. 4GB will cause OOM kills during Kata installation.
-
-### Step 2: Verify Nested Virtualization in VM
-
-```bash
-minikube ssh "ls -la /dev/kvm"
-# Should show: crw-rw-rw- 1 root kvm 10, 232 ... /dev/kvm
-```
-
-### Step 3: Prepare Persistent Storage for Kata
-
-Minikube uses tmpfs for root filesystem which is limited. Kata artifacts (~2.5GB) need persistent storage:
-
-```bash
-minikube ssh "sudo mkdir -p /mnt/vda1/opt/kata && sudo mkdir -p /opt/kata && sudo mount --bind /mnt/vda1/opt/kata /opt/kata"
-```
-
-**Note:** This bind mount is lost on VM restart. Re-run after `minikube start`.
-
-### Step 4: Build Helm Dependencies
-
-```bash
-cd tools/packaging/kata-deploy/helm-chart/kata-deploy
-helm dependency build
-```
-
-### Step 5: Install Kata with Dragonball
-
-```bash
-helm install kata-deploy ./tools/packaging/kata-deploy/helm-chart/kata-deploy \
-  --namespace kube-system \
-  --set shims.disableAll=true \
-  --set shims.dragonball.enabled=true \
-  --set defaultShim.amd64=dragonball \
-  --set runtimeClasses.createDefault=true \
-  --set runtimeClasses.defaultName=kata-dragonball \
-  --set debug=true
-```
-
-If you get "runtimeclass already exists" error, use `helm upgrade` instead:
-```bash
-helm upgrade kata-deploy ./tools/packaging/kata-deploy/helm-chart/kata-deploy \
-  --namespace kube-system \
-  --set shims.disableAll=true \
-  --set shims.dragonball.enabled=true \
-  --set defaultShim.amd64=dragonball \
-  --set runtimeClasses.createDefault=true \
-  --set runtimeClasses.defaultName=kata-dragonball \
-  --set debug=true
-```
-
-### Step 6: Wait for Installation
-
-The kata-deploy image is ~1.8GB. Installation takes several minutes:
-
-```bash
-kubectl wait --for=condition=ready pod -l app=kata-deploy -n kube-system --timeout=600s
-```
-
-**Monitor progress:**
-```bash
-kubectl logs -f -n kube-system -l app=kata-deploy
-```
-
-**Expected final log:**
-```
-Kata Containers installation completed successfully
-Install completed, daemonset mode: sleeping forever
-```
-
-### Step 7: Verify Installation
-
-```bash
-# Check RuntimeClass
-kubectl get runtimeclass
-# Should show: kata-dragonball
-
-# Check Kata binaries
-minikube ssh "ls /opt/kata/runtime-rs/bin/"
-# Should show: containerd-shim-kata-v2
-```
-
-### Step 8: Test with a Pod
-
-```bash
-cat <<'EOF' | kubectl apply -f -
-apiVersion: v1
-kind: Pod
-metadata:
-  name: nginx-kata-dragonball
-spec:
-  runtimeClassName: kata-dragonball
-  containers:
-  - name: nginx
-    image: nginx:alpine
-EOF
-```
-
-**Verify it's running in a Kata VM:**
-```bash
-# Pod kernel (Kata guest)
-kubectl exec nginx-kata-dragonball -- uname -r
-# Should show something like: 6.12.47
-
-# Host kernel
-minikube ssh "uname -r"
-# Should show something like: 5.10.207 (different from pod)
-
-# Kata shim process
-minikube ssh "ps aux | grep containerd-shim-kata"
-# Should show: /opt/kata/runtime-rs/bin/containerd-shim-kata-v2
-```
-
-### Cleanup
-
-```bash
-kubectl delete pod nginx-kata-dragonball
-helm uninstall kata-deploy -n kube-system
-minikube delete
-```
-
-### Troubleshooting
-
-**API server stops / etcd timeouts:**
-- Usually caused by disk I/O saturation during Kata file copy
-- Wait for installation to complete, then run `minikube start` to recover
-
-**"No space left on device" error:**
-- tmpfs is full; ensure bind mount to persistent storage (Step 3)
-
-**OOM kills:**
-- Increase VM memory to 8GB or more
-
-**Check disk I/O:**
-```bash
-minikube ssh "iostat -x 1 3"
-# High %iowait indicates disk bottleneck
-```
-
-**Check memory:**
-```bash
-minikube ssh "free -h"
-```
-
-**Check for OOM kills:**
-```bash
-minikube ssh "sudo dmesg | grep -i oom"
-```
-
-### Architecture
-
-```
-Host PC
-└─ Minikube VM (KVM, 8GB RAM)
-   ├─ /dev/kvm (nested virtualization)
-   ├─ containerd
-   │   └─ kata-dragonball runtime
-   └─ Kubernetes
-       └─ Pod with runtimeClassName: kata-dragonball
-           └─ Kata Guest VM (Dragonball hypervisor)
-               └─ Container
 ```
 
 ### Key Paths
@@ -241,3 +163,5 @@ Host PC
 | Dragonball config | `/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-dragonball.toml` |
 | Kata guest kernel | `/opt/kata/share/kata-containers/vmlinux-dragonball-experimental.container` |
 | Kata guest image | `/opt/kata/share/kata-containers/kata-containers.img` |
+
+</details>
