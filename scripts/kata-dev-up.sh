@@ -61,7 +61,7 @@ else
     MASTER_NAME="kata-master"
     MASTER_CPUS=2  MASTER_MEMORY="2G"  MASTER_DISK="10G"
     WORKER_NAMES=("kata-worker-1" "kata-worker-2")
-    WORKER_CPUS=2  WORKER_MEMORY="4G"  WORKER_DISK="10G"
+    WORKER_CPUS=2  WORKER_MEMORY="4G"  WORKER_DISK="20G"
 fi
 
 ALL_VMS=("$MASTER_NAME" "${WORKER_NAMES[@]}")
@@ -147,6 +147,22 @@ install_crio() {
             systemctl enable --now crio
         "
     fi
+}
+
+# kata-deploy expects /etc/containerd/config.toml even on CRI-O-only workers.
+# Create a minimal stub so kata-deploy doesn't crash.
+ensure_containerd_config_stub() {
+    local name="$1"
+    vm_exec "$name" "
+        mkdir -p /etc/containerd
+        [ -f /etc/containerd/config.toml ] || cat > /etc/containerd/config.toml <<'CTRD'
+version = 2
+[plugins]
+  [plugins.\"io.containerd.grpc.v1.cri\"]
+    [plugins.\"io.containerd.grpc.v1.cri\".containerd]
+      default_runtime_name = \"runc\"
+CTRD
+    "
 }
 
 install_k3s_server() {
@@ -282,7 +298,7 @@ install_kata_deploy() {
         rm -rf /tmp/kata-deploy-chart
     "
 
-    wait_for_pod "app=kata-deploy" "kube-system" 600
+    wait_for_pod "name=kata-deploy" "kube-system" 600
 }
 
 add_kata_runtime_alias() {
@@ -370,7 +386,7 @@ install_ceph_csi() {
     ceph_key=$(vm_exec "$ceph_node" "ceph auth get-key client.kubernetes")
 
     vm_exec "$MASTER_NAME" "
-        KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+        export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
         helm repo add ceph-csi https://ceph.github.io/csi-charts
         helm repo update
         kubectl create namespace ceph-csi --dry-run=client -o yaml | kubectl apply -f -
@@ -475,9 +491,10 @@ else
     done
     kubectl_master "get nodes"
 
-    # Step 5: Label worker nodes for kata
+    # Step 5: Label worker nodes for kata + containerd stub
     for w in "${WORKER_NAMES[@]}"; do
         label_kata_node "$w"
+        ensure_containerd_config_stub "$w"
     done
 
     # Step 6: Install kata-deploy (DaemonSet runs on workers only — master is tainted)
