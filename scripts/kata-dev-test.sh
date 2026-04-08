@@ -17,7 +17,12 @@ TEST_DIR="${REPO_ROOT}/tests/integration/kubernetes"
 
 # --- environment for kata-dev VM with k3s + CRI-O + kata-deploy (qemu-coco-dev) ---
 
-VM_NAME="kata-dev"
+# Auto-detect: multi-node (kata-master) or single-node (kata-dev)
+if multipass info kata-master &>/dev/null 2>&1; then
+    VM_NAME="kata-master"
+else
+    VM_NAME="kata-dev"
+fi
 KUBECONFIG_HOST="/tmp/kata-dev-kubeconfig.yaml"
 
 export KUBECONFIG="${KUBECONFIG_HOST}"
