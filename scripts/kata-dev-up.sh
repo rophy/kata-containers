@@ -361,14 +361,11 @@ install_kata_deploy() {
 add_kata_runtime_alias() {
     local name="$1"
     log "[$name] Adding 'kata' CRI-O runtime..."
+    # Write to a separate file (99-kata-local) so kata-deploy can't overwrite it.
+    # kata-deploy writes 99-kata-deploy; our alias goes in 99-kata-local.
     vm_exec "$name" "
-        # Retry loop: kata-deploy may still be writing the config file
-        for attempt in 1 2 3; do
-            if grep -q '\\[crio.runtime.runtimes.kata\\]' /etc/crio/crio.conf.d/99-kata-deploy 2>/dev/null; then
-                break
-            fi
-            cat >> /etc/crio/crio.conf.d/99-kata-deploy <<'EOF'
-
+        if [ ! -f /etc/crio/crio.conf.d/99-kata-local ]; then
+            cat > /etc/crio/crio.conf.d/99-kata-local <<'EOF'
 [crio.runtime.runtimes.kata]
 	runtime_path = \"/opt/kata/runtime-rs/bin/containerd-shim-kata-v2\"
 	runtime_type = \"vm\"
@@ -377,14 +374,8 @@ add_kata_runtime_alias() {
 	privileged_without_host_devices = true
 	runtime_pull_image = true
 EOF
-            # Verify append survived (kata-deploy may have overwritten)
-            if grep -q '\\[crio.runtime.runtimes.kata\\]' /etc/crio/crio.conf.d/99-kata-deploy 2>/dev/null; then
-                break
-            fi
-            echo 'kata runtime config was overwritten, retrying in 10s...' >&2
-            sleep 10
-        done
-        systemctl restart crio
+            systemctl restart crio
+        fi
     "
     # Create RuntimeClass (idempotent)
     kubectl_master "get runtimeclass kata &>/dev/null 2>&1 || \
