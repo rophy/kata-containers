@@ -134,8 +134,17 @@ wait_for_node_ready() {
 
 wait_for_pod() {
     local label="$1" ns="$2" timeout="${3:-300}"
+    local deadline=$((SECONDS + timeout))
     log "Waiting for pod $label in $ns (timeout ${timeout}s)..."
-    kubectl_master "wait --for=condition=ready pod -l $label -n $ns --timeout=${timeout}s"
+    while [[ $SECONDS -lt $deadline ]]; do
+        if kubectl_master "wait --for=condition=ready pod -l $label -n $ns --timeout=30s" 2>/dev/null; then
+            return 0
+        fi
+        sleep 5
+    done
+    echo "ERROR: pods with label $label in $ns not ready within ${timeout}s" >&2
+    kubectl_master "get pods -n $ns -l $label -o wide" >&2 || true
+    exit 1
 }
 
 export_kubeconfig() {
