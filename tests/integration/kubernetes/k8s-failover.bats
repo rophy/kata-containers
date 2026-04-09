@@ -177,3 +177,109 @@ EOF
     read_back=$(read_marker "failover-test-0" "/data/marker.txt")
     [ "$read_back" = "$marker" ]
 }
+
+@test "Block passthrough: data survives node failure with kata runtime" {
+    # Create StatefulSet with block volumeMode + kata annotations for direct passthrough.
+    # The shim reads annotations to auto-mount block devices inside the VM.
+    kubectl apply -f - <<'EOF'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: failover-test
+spec:
+  serviceName: failover-test
+  replicas: 1
+  selector:
+    matchLabels:
+      app: failover-test
+  template:
+    metadata:
+      labels:
+        app: failover-test
+      annotations:
+        io.katacontainers.volume.data.mount_path: "/data"
+        io.katacontainers.volume.data.fs_type: "ext4"
+    spec:
+      runtimeClassName: kata-qemu-coco-dev
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        kubernetes.io/hostname: kata-worker-1
+      containers:
+      - name: app
+        image: busybox
+        command: ["sleep", "infinity"]
+        volumeDevices:
+        - name: data
+          devicePath: /dev/block-data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: ceph-rbd
+      volumeMode: Block
+      resources:
+        requests:
+          storage: 64Mi
+EOF
+
+    # Wait for pod to be ready
+    run wait_pod_running "failover-test-0" 180
+    [ "$status" -eq 0 ]
+
+    # Verify running on worker-1
+    local node
+    node=$(get_pod_node "failover-test-0")
+    [ "$node" = "kata-worker-1" ]
+
+    # Verify /data is a real block device mount (not tmpfs)
+    local mount_type
+    mount_type=$(kubectl exec failover-test-0 -- sh -c "df -T /data | tail -1 | awk '{print \$2}'" 2>&1)
+    echo "mount type: $mount_type"
+    [ "$mount_type" = "ext4" ]
+
+    # Write test data
+    local marker="block-failover-$(date +%s)"
+    write_marker "failover-test-0" "/data/marker.txt" "$marker"
+
+    # Sync to ensure data is flushed to block device
+    kubectl exec failover-test-0 -- sync
+
+    # Verify data is readable
+    local read_back
+    read_back=$(read_marker "failover-test-0" "/data/marker.txt")
+    [ "$read_back" = "$marker" ]
+
+    # --- Simulate node failure ---
+    multipass stop kata-worker-1
+
+    # Remove nodeSelector so StatefulSet can schedule on worker-2
+    kubectl patch statefulset failover-test --type='json' \
+        -p='[{"op": "remove", "path": "/spec/template/spec/nodeSelector"}]'
+
+    # Delete the pod (stuck Terminating on dead node)
+    kubectl delete pod failover-test-0 --force --grace-period=0
+
+    # Delete stale VolumeAttachment for RWO reattach
+    local va
+    va=$(kubectl get volumeattachment -o jsonpath='{.items[?(@.spec.nodeName=="kata-worker-1")].metadata.name}')
+    if [[ -n "$va" ]]; then
+        kubectl delete volumeattachment "$va" --force --grace-period=0
+    fi
+
+    # Wait for pod to come up on worker-2
+    run wait_pod_running "failover-test-0" 300
+    [ "$status" -eq 0 ]
+
+    # Verify it moved to worker-2
+    node=$(get_pod_node "failover-test-0")
+    [ "$node" = "kata-worker-2" ]
+
+    # Verify mount is still ext4 (not tmpfs)
+    mount_type=$(kubectl exec failover-test-0 -- sh -c "df -T /data | tail -1 | awk '{print \$2}'" 2>&1)
+    [ "$mount_type" = "ext4" ]
+
+    # --- Verify data survived ---
+    read_back=$(read_marker "failover-test-0" "/data/marker.txt")
+    [ "$read_back" = "$marker" ]
+}
