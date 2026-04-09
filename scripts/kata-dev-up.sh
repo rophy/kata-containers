@@ -267,7 +267,7 @@ start_agent_and_setup_cni() {
     "
 }
 
-# Single-node: same as setup_worker_cni but for k3s server (flannel config exists immediately)
+# Single-node: k3s server creates flannel config immediately (no wait needed)
 setup_server_cni() {
     local name="$1"
     log "[$name] Setting up CNI symlinks..."
