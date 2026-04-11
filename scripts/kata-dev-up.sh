@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 #
-# Provision kata-dev test environment with k3s + CRI-O + kata-deploy + MicroCeph + ceph-csi.
+# Provision kata-dev test environment with k3s + CRI-O + kata (tarball) + MicroCeph + ceph-csi.
 # Idempotent: safe to re-run on existing VMs (skips already-completed steps).
+#
+# Prerequisites:
+#   Build the kata tarball first:
+#     cd tools/packaging/kata-deploy/local-build && make -f Makefile kata-tarball
+#   Or place a pre-built tarball at the default path.
 #
 # Usage:
 #   ./scripts/kata-dev-up.sh                # single-node (default)
 #   ./scripts/kata-dev-up.sh --nodes 3      # 3-node cluster for failover testing
 #   ./scripts/kata-dev-up.sh --no-ceph      # skip MicroCeph + ceph-csi
+#   ./scripts/kata-dev-up.sh --tarball /path/to/kata-static.tar.zst
 #
 # Single-node layout (kata-dev):
-#   - k3s server + CRI-O + kata-deploy + MicroCeph + ceph-csi (all-in-one)
+#   - k3s server + CRI-O + kata (static tarball) + MicroCeph + ceph-csi (all-in-one)
 #
 # 3-node layout:
 #   kata-master   (2 CPU, 4GB, 10GB) — k3s server (containerd), MicroCeph, tainted NoSchedule
-#   kata-worker-1 (2 CPU, 4GB, 30GB) — k3s agent + CRI-O + kata-deploy (needs /dev/kvm)
-#   kata-worker-2 (2 CPU, 4GB, 30GB) — k3s agent + CRI-O + kata-deploy (needs /dev/kvm)
+#   kata-worker-1 (2 CPU, 4GB, 30GB) — k3s agent + CRI-O + kata (static tarball)
+#   kata-worker-2 (2 CPU, 4GB, 30GB) — k3s agent + CRI-O + kata (static tarball)
 #
 set -euo pipefail
 
@@ -35,12 +41,16 @@ MICROCEPH_OSD_COUNT=3
 
 KUBECONFIG_HOST="/tmp/kata-dev-kubeconfig.yaml"
 
+KATA_TARBALL=""  # Path to kata-static.tar.zst (auto-detected if not set)
+KATA_SHIM="qemu-coco-dev"  # Which kata shim/config to enable
+
 # --- parse args ---
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --nodes)   NUM_NODES="$2"; shift 2 ;;
-        --no-ceph) INSTALL_CEPH=false; shift ;;
+        --nodes)    NUM_NODES="$2"; shift 2 ;;
+        --no-ceph)  INSTALL_CEPH=false; shift ;;
+        --tarball)  KATA_TARBALL="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -49,6 +59,18 @@ if [[ "$NUM_NODES" != "1" && "$NUM_NODES" != "3" ]]; then
     echo "ERROR: --nodes must be 1 or 3" >&2
     exit 1
 fi
+
+# Auto-detect tarball path
+if [[ -z "$KATA_TARBALL" ]]; then
+    KATA_TARBALL="${REPO_ROOT}/tools/packaging/kata-deploy/local-build/kata-static.tar.zst"
+fi
+if [[ ! -f "$KATA_TARBALL" ]]; then
+    echo "ERROR: Kata tarball not found at $KATA_TARBALL" >&2
+    echo "Build it first:" >&2
+    echo "  cd tools/packaging/kata-deploy/local-build && make -f Makefile kata-tarball" >&2
+    exit 1
+fi
+echo "==> Using kata tarball: $KATA_TARBALL"
 
 # --- VM sizing ---
 
@@ -187,22 +209,94 @@ install_crio() {
     fi
 }
 
-# kata-deploy reads /etc/containerd/config.toml even on CRI-O-only nodes.
-# Without this stub, kata-deploy crashes with "No such file or directory".
-create_containerd_stub() {
+# Install kata from static tarball on a VM node.
+# Extracts binaries to /opt/kata/, configures CRI-O, creates RuntimeClass.
+install_kata_on_node() {
     local name="$1"
+    if vm_exec "$name" "[ -x /opt/kata/bin/containerd-shim-kata-v2 ]"; then
+        log "[$name] Kata already installed"
+        return
+    fi
+    log "[$name] Transferring kata tarball..."
+    multipass transfer "$KATA_TARBALL" "${name}:/tmp/kata-static.tar.zst"
+
+    log "[$name] Extracting kata tarball to /opt/kata/..."
     vm_exec "$name" "
-        if [ ! -f /etc/containerd/config.toml ]; then
-            mkdir -p /etc/containerd
-            cat > /etc/containerd/config.toml <<'CTRD'
-version = 2
-[plugins]
-  [plugins.\"io.containerd.grpc.v1.cri\"]
-    [plugins.\"io.containerd.grpc.v1.cri\".containerd]
-      default_runtime_name = \"runc\"
-CTRD
+        tar --zstd -xf /tmp/kata-static.tar.zst -C /
+        rm -f /tmp/kata-static.tar.zst
+
+        # The tarball puts configs at /opt/kata/share/defaults/kata-containers/configuration-*.toml
+        # but CRI-O runtime_config_path expects them under runtimes/<shim>/ subdirectory.
+        SHIM=${KATA_SHIM}
+        RUNTIMES_DIR=/opt/kata/share/defaults/kata-containers/runtimes/\${SHIM}
+        mkdir -p \${RUNTIMES_DIR}
+        if [ ! -f \${RUNTIMES_DIR}/configuration-\${SHIM}.toml ]; then
+            cp /opt/kata/share/defaults/kata-containers/configuration-\${SHIM}.toml \${RUNTIMES_DIR}/
         fi
     "
+
+    log "[$name] Configuring CRI-O for kata-${KATA_SHIM}..."
+    vm_exec "$name" "
+        SHIM=${KATA_SHIM}
+        CONFIG_PATH=/opt/kata/share/defaults/kata-containers/runtimes/\${SHIM}/configuration-\${SHIM}.toml
+        cat > /etc/crio/crio.conf.d/50-kata.conf <<EOF
+[crio.runtime.runtimes.kata-\${SHIM}]
+runtime_path = \"/opt/kata/bin/containerd-shim-kata-v2\"
+runtime_type = \"vm\"
+runtime_root = \"/run/vc\"
+runtime_config_path = \"\${CONFIG_PATH}\"
+privileged_without_host_devices = true
+runtime_pull_image = true
+
+[crio.runtime.runtimes.kata]
+runtime_path = \"/opt/kata/bin/containerd-shim-kata-v2\"
+runtime_type = \"vm\"
+runtime_root = \"/run/vc\"
+runtime_config_path = \"\${CONFIG_PATH}\"
+privileged_without_host_devices = true
+runtime_pull_image = true
+EOF
+        systemctl restart crio
+    "
+
+    log "[$name] Kata installed"
+}
+
+# Apply drop-in config overrides for block passthrough development.
+install_kata_config_overrides() {
+    local name="$1"
+    vm_exec "$name" "
+        SHIM=${KATA_SHIM}
+        CONFIG_DIR=/opt/kata/share/defaults/kata-containers/runtimes/\${SHIM}/config.d
+        mkdir -p \${CONFIG_DIR}
+        cat > \${CONFIG_DIR}/50-dev.toml <<'TOML'
+[hypervisor.qemu]
+kernel_verity_params = \"\"
+disable_block_device_use = false
+
+[runtime]
+name = \"virt_container\"
+hypervisor_name = \"qemu\"
+agent_name = \"kata\"
+TOML
+    "
+}
+
+# Create RuntimeClasses for the kata shim.
+create_kata_runtime_class() {
+    kubectl_master "kubectl apply -f - <<'RC'
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-${KATA_SHIM}
+handler: kata-${KATA_SHIM}
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata
+handler: kata
+RC"
 }
 
 install_k3s_server() {
@@ -326,67 +420,8 @@ install_host_tools() {
         chmod +x "${HOME}/.local/bin/yq"
     fi
     command -v bats &>/dev/null || log "[host] WARNING: bats not found. Install via: sudo apt-get install bats"
-    command -v helm &>/dev/null || log "[host] WARNING: helm not found. Install via: snap install helm --classic"
 }
 
-install_kata_deploy() {
-    if kubectl_master "helm status kata-deploy -n kube-system &>/dev/null" 2>/dev/null; then
-        log "kata-deploy already installed"
-        return
-    fi
-    log "Installing kata-deploy via helm..."
-    if [ ! -d "${REPO_ROOT}/tools/packaging/kata-deploy/helm-chart/kata-deploy/charts" ]; then
-        (cd "${REPO_ROOT}/tools/packaging/kata-deploy/helm-chart/kata-deploy" && helm dependency build)
-    fi
-    multipass transfer -r "${REPO_ROOT}/tools/packaging/kata-deploy/helm-chart/kata-deploy" "${MASTER_NAME}:/tmp/kata-deploy-chart"
-    vm_exec "$MASTER_NAME" "
-        KUBECONFIG=/etc/rancher/k3s/k3s.yaml \
-        helm install kata-deploy /tmp/kata-deploy-chart \
-            --namespace kube-system \
-            --set debug=true \
-            --set shims.disableAll=true \
-            --set shims.qemu-coco-dev.enabled=true \
-            --set shims.qemu-coco-dev.crio.guestPull=true \
-            --set shims.qemu-coco-dev.containerd.forceGuestPull=true \
-            --set defaultShim.amd64=qemu-coco-dev \
-            --set runtimeClasses.createDefault=true \
-            --set runtimeClasses.defaultName=kata-qemu-coco-dev
-        rm -rf /tmp/kata-deploy-chart
-    "
-    wait_for_pod "name=kata-deploy" "kube-system" 600
-}
-
-# Add 'kata' as a CRI-O runtime alias pointing to runtime-rs qemu-coco-dev config.
-# Must run AFTER kata-deploy completes (kata-deploy writes 99-kata-deploy config file).
-add_kata_runtime_alias() {
-    local name="$1"
-    log "[$name] Adding 'kata' CRI-O runtime..."
-    # Write to a separate file (99-kata-local) so kata-deploy can't overwrite it.
-    # kata-deploy writes 99-kata-deploy; our alias goes in 99-kata-local.
-    vm_exec "$name" "
-        if [ ! -f /etc/crio/crio.conf.d/99-kata-local ]; then
-            cat > /etc/crio/crio.conf.d/99-kata-local <<'EOF'
-[crio.runtime.runtimes.kata]
-	runtime_path = \"/opt/kata/runtime-rs/bin/containerd-shim-kata-v2\"
-	runtime_type = \"vm\"
-	runtime_root = \"/run/vc\"
-	runtime_config_path = \"/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-qemu-coco-dev-runtime-rs.toml\"
-	privileged_without_host_devices = true
-	runtime_pull_image = true
-EOF
-            systemctl restart crio
-        fi
-    "
-    # Create RuntimeClass (idempotent)
-    kubectl_master "get runtimeclass kata &>/dev/null 2>&1 || \
-        kubectl apply -f - <<'RC'
-apiVersion: node.k8s.io/v1
-kind: RuntimeClass
-metadata:
-  name: kata
-handler: kata
-RC"
-}
 
 install_microceph() {
     local name="$1"
@@ -475,13 +510,15 @@ install_rbd_on_worker() {
     "
 }
 
-# Full worker setup: disable needrestart, install CRI-O, containerd stub, k3s agent,
-# wait for CNI, then install tools. Designed to run in parallel for multiple workers.
+# Full worker setup: disable needrestart, install CRI-O, install kata (before
+# k3s-agent starts so kubelet sees the kata handler on first query), then
+# start k3s-agent and install tools.
 provision_worker() {
     local name="$1" server_url="$2" token="$3"
     disable_needrestart "$name"
     install_crio "$name"
-    create_containerd_stub "$name"
+    install_kata_on_node "$name"
+    install_kata_config_overrides "$name"
     install_k3s_agent "$name" "$server_url" "$token"
     start_agent_and_setup_cni "$name"
     install_yq_vm "$name"
@@ -507,9 +544,13 @@ if [[ "$NUM_NODES" == "1" ]]; then
     install_host_tools
     install_yq_vm "$MASTER_NAME"
     install_helm_vm "$MASTER_NAME"
+    install_kata_on_node "$MASTER_NAME"
+    install_kata_config_overrides "$MASTER_NAME"
+    create_kata_runtime_class
     kubectl_master "label node $MASTER_NAME katacontainers.io/kata-runtime=true --overwrite"
-    install_kata_deploy
-    add_kata_runtime_alias "$MASTER_NAME"
+    # Restart k3s so kubelet picks up the new CRI-O runtime handler
+    vm_exec "$MASTER_NAME" "systemctl restart k3s"
+    wait_for_k3s "$MASTER_NAME"
     if [[ "$INSTALL_CEPH" == "true" ]]; then
         install_microceph "$MASTER_NAME"
         install_ceph_csi
@@ -538,7 +579,7 @@ else
     MASTER_IP=$(get_vm_ip "$MASTER_NAME")
     K3S_URL="https://${MASTER_IP}:6443"
 
-    # Step 4: Provision workers in parallel
+    # Step 4: Provision workers in parallel (includes kata tarball install)
     for w in "${WORKER_NAMES[@]}"; do
         provision_worker "$w" "$K3S_URL" "$K3S_TOKEN" &
     done
@@ -549,21 +590,16 @@ else
         wait_for_node_ready "$w" 120
     done
 
-    # Step 6: Label workers, install kata-deploy
+    # Step 6: Label workers and create RuntimeClass
     for w in "${WORKER_NAMES[@]}"; do
         kubectl_master "label node $w katacontainers.io/kata-runtime=true --overwrite"
     done
-    install_kata_deploy
+    create_kata_runtime_class
 
-    # Step 7: Add kata runtime alias (AFTER kata-deploy writes CRI-O config)
-    for w in "${WORKER_NAMES[@]}"; do
-        add_kata_runtime_alias "$w"
-    done
-
-    # Step 8: Host tools
+    # Step 7: Host tools
     install_host_tools
 
-    # Step 9: MicroCeph + ceph-csi
+    # Step 8: MicroCeph + ceph-csi
     if [[ "$INSTALL_CEPH" == "true" ]]; then
         install_microceph "$MASTER_NAME"
         install_ceph_csi

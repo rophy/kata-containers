@@ -12,4 +12,30 @@ RUN apt-get update && apt-get install -y \
 
 RUN rustup target add x86_64-unknown-linux-musl
 
+# Build libseccomp from source for musl (static linking).
+# The Debian libseccomp-dev package is glibc-only; the agent needs musl.
+ARG GPERF_VERSION=3.3
+ARG LIBSECCOMP_VERSION=2.6.0
+RUN set -eux; \
+    cd /tmp; \
+    # gperf (required by libseccomp)
+    curl -sLO "https://ftp.gnu.org.uk/gnu/gperf/gperf-${GPERF_VERSION}.tar.gz"; \
+    tar -xf gperf-${GPERF_VERSION}.tar.gz; \
+    cd gperf-${GPERF_VERSION}; \
+    ./configure --prefix=/usr/local; make; make install; \
+    cd /tmp; \
+    # libseccomp
+    curl -sLO "https://github.com/seccomp/libseccomp/releases/download/v${LIBSECCOMP_VERSION}/libseccomp-${LIBSECCOMP_VERSION}.tar.gz"; \
+    tar -xf libseccomp-${LIBSECCOMP_VERSION}.tar.gz; \
+    cd libseccomp-${LIBSECCOMP_VERSION}; \
+    CFLAGS="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=1 -O2" ./configure \
+        --prefix=/opt/lib-musl \
+        --enable-static --host=x86_64; \
+    make; make install; \
+    rm -rf /tmp/gperf-* /tmp/libseccomp-*
+
+ENV LIBSECCOMP_LINK_TYPE=static
+ENV LIBSECCOMP_LIB_PATH=/opt/lib-musl/lib
+ENV PKG_CONFIG_PATH=/opt/lib-musl/lib/pkgconfig:${PKG_CONFIG_PATH}
+
 WORKDIR /workspace

@@ -147,7 +147,18 @@ EOF
 
     # --- Simulate node failure ---
     # Stop worker-1 VM
-    multipass stop kata-worker-1
+    multipass stop --force kata-worker-1
+
+    # Wait for Kubernetes to detect node as NotReady
+    local deadline=$((SECONDS + 60))
+    while [[ $SECONDS -lt $deadline ]]; do
+        local node_status
+        node_status=$(kubectl get node kata-worker-1 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+        if [[ "$node_status" != "True" ]]; then
+            break
+        fi
+        sleep 5
+    done
 
     # Remove nodeSelector so StatefulSet can schedule on worker-2
     kubectl patch statefulset failover-test --type='json' \
@@ -165,8 +176,11 @@ EOF
         kubectl delete volumeattachment "$va" --force --grace-period=0
     fi
 
+    # Blacklist the dead node in Ceph so the RBD exclusive lock is released
+    multipass exec kata-master -- sudo ceph osd blocklist add "10.135.230.192" 2>/dev/null || true
+
     # Wait for pod to come up on worker-2
-    run wait_pod_running "failover-test-0" 300
+    run wait_pod_running "failover-test-0" 600
     [ "$status" -eq 0 ]
 
     # Verify it moved to worker-2
@@ -197,8 +211,8 @@ spec:
       labels:
         app: failover-test
       annotations:
-        io.katacontainers.volume.data.mount_path: "/data"
-        io.katacontainers.volume.data.fs_type: "ext4"
+        io.katacontainers.volume.block-data.mount_path: "/data"
+        io.katacontainers.volume.block-data.fs_type: "ext4"
     spec:
       runtimeClassName: kata-qemu-coco-dev
       terminationGracePeriodSeconds: 5
@@ -251,7 +265,18 @@ EOF
     [ "$read_back" = "$marker" ]
 
     # --- Simulate node failure ---
-    multipass stop kata-worker-1
+    multipass stop --force kata-worker-1
+
+    # Wait for Kubernetes to detect node as NotReady
+    local deadline=$((SECONDS + 60))
+    while [[ $SECONDS -lt $deadline ]]; do
+        local node_status
+        node_status=$(kubectl get node kata-worker-1 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+        if [[ "$node_status" != "True" ]]; then
+            break
+        fi
+        sleep 5
+    done
 
     # Remove nodeSelector so StatefulSet can schedule on worker-2
     kubectl patch statefulset failover-test --type='json' \
@@ -267,8 +292,16 @@ EOF
         kubectl delete volumeattachment "$va" --force --grace-period=0
     fi
 
-    # Wait for pod to come up on worker-2
-    run wait_pod_running "failover-test-0" 300
+    # Blacklist the dead node in Ceph so the RBD exclusive lock is released immediately
+    local master_ip
+    master_ip=$(kubectl get node kata-master -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+    local worker1_ip
+    worker1_ip="10.135.230.192"
+    # Try to add a temporary Ceph blocklist entry for the dead node
+    multipass exec kata-master -- sudo ceph osd blocklist add "$worker1_ip" 2>/dev/null || true
+
+    # Wait for pod to come up on worker-2 (allow extra time for RBD reattach)
+    run wait_pod_running "failover-test-0" 600
     [ "$status" -eq 0 ]
 
     # Verify it moved to worker-2

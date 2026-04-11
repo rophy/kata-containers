@@ -3,15 +3,24 @@
 ## Quick Reference — Multipass k3s (primary test environment)
 
 **VM:** `kata-dev` (Multipass, 4 CPU, 8GB RAM, 50GB disk, Ubuntu 24.04)
-**Runtime:** k3s + CRI-O + kata-deploy (qemu-coco-dev, runtime-rs)
+**Runtime:** k3s + CRI-O + kata (static tarball, qemu-coco-dev)
 **Kubeconfig:** `/tmp/kata-dev-kubeconfig.yaml`
+
+### Prerequisites — build kata tarball
+
+```bash
+cd tools/packaging/kata-deploy/local-build
+make -f Makefile kata-tarball    # full build (~80 min first time)
+# Output: tools/packaging/kata-deploy/local-build/kata-static.tar.zst
+```
 
 ### Scripts
 
 ```bash
-# Provision VM (idempotent, includes k3s + CRI-O + kata-deploy + MicroCeph + ceph-csi)
+# Provision VM (idempotent, includes k3s + CRI-O + kata tarball + MicroCeph + ceph-csi)
 ./scripts/kata-dev-up.sh            # full setup
 ./scripts/kata-dev-up.sh --no-ceph  # skip MicroCeph + ceph-csi
+./scripts/kata-dev-up.sh --tarball /path/to/kata-static.tar.zst  # custom tarball
 
 # Run BATS integration tests
 ./scripts/kata-dev-test.sh                        # all 39 applicable tests
@@ -72,7 +81,7 @@ Tests excluded from the suite (not applicable to single-node k3s + qemu-coco-dev
 |-----------|---------|-------|
 | k3s | v1.34 | `--container-runtime-endpoint unix:///var/run/crio/crio.sock` |
 | CRI-O | v1.33 | apt repo `isv:/cri-o:/stable:/v1.33` |
-| kata-deploy | 3.28.0 | Helm chart, qemu-coco-dev shim |
+| kata | local build | Static tarball install to `/opt/kata/`, qemu-coco-dev |
 | yq | v4.44.5 | mikefarah/yq, installed on **host** and VM |
 | MicroCeph | snap | 3 loop OSD disks (2GB each) |
 | ceph-csi-rbd | 3.16.2 | Helm chart, `ceph-rbd` StorageClass |
@@ -81,10 +90,10 @@ Tests excluded from the suite (not applicable to single-node k3s + qemu-coco-dev
 
 | Component | Path |
 |-----------|------|
-| Kata runtime-rs shim | `/opt/kata/runtime-rs/bin/containerd-shim-kata-v2` |
+| Kata shim (Go+Rust) | `/opt/kata/bin/containerd-shim-kata-v2` |
 | qemu-coco-dev config | `/opt/kata/share/defaults/kata-containers/runtimes/qemu-coco-dev/configuration-qemu-coco-dev.toml` |
-| runtime-rs config | `/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-qemu-coco-dev-runtime-rs.toml` |
-| CRI-O kata config | `/etc/crio/crio.conf.d/99-kata-deploy` |
+| Dev overrides | `/opt/kata/share/defaults/kata-containers/runtimes/qemu-coco-dev/config.d/50-dev.toml` |
+| CRI-O kata config | `/etc/crio/crio.conf.d/50-kata.conf` |
 | CNI config | `/etc/cni/net.d/10-flannel.conflist` (symlink to k3s) |
 
 ### Architecture
@@ -95,11 +104,11 @@ Host PC
    ├─ /dev/kvm (nested virtualization)
    ├─ k3s (control plane + worker)
    ├─ CRI-O (container runtime)
-   ├─ kata-deploy DaemonSet
-   │   └─ qemu-coco-dev runtime (runtime-rs)
+   ├─ /opt/kata/ (static tarball install, no DaemonSet)
+   │   └─ qemu-coco-dev runtime
    ├─ MicroCeph (3 OSD, ceph-rbd StorageClass)
    └─ Kubernetes
-       └─ Pod with runtimeClassName: kata
+       └─ Pod with runtimeClassName: kata-qemu-coco-dev
            └─ Kata Guest VM (QEMU)
                └─ Container
 ```
