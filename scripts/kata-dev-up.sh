@@ -236,15 +236,19 @@ install_kata_on_node() {
     "
 
     log "[$name] Configuring CRI-O for kata-${KATA_SHIM}..."
+    # Two runtime entries:
+    #   kata / kata-${SHIM}    -> Go shim (legacy, qemu)
+    #   kata-${SHIM}-runtime-rs -> Rust shim (required for block-volume auto-mount)
     vm_exec "$name" "
         SHIM=${KATA_SHIM}
-        CONFIG_PATH=/opt/kata/share/defaults/kata-containers/runtimes/\${SHIM}/configuration-\${SHIM}.toml
+        GO_CONFIG=/opt/kata/share/defaults/kata-containers/runtimes/\${SHIM}/configuration-\${SHIM}.toml
+        RS_CONFIG=/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-\${SHIM}-runtime-rs.toml
         cat > /etc/crio/crio.conf.d/50-kata.conf <<EOF
 [crio.runtime.runtimes.kata-\${SHIM}]
 runtime_path = \"/opt/kata/bin/containerd-shim-kata-v2\"
 runtime_type = \"vm\"
 runtime_root = \"/run/vc\"
-runtime_config_path = \"\${CONFIG_PATH}\"
+runtime_config_path = \"\${GO_CONFIG}\"
 privileged_without_host_devices = true
 runtime_pull_image = true
 
@@ -252,7 +256,15 @@ runtime_pull_image = true
 runtime_path = \"/opt/kata/bin/containerd-shim-kata-v2\"
 runtime_type = \"vm\"
 runtime_root = \"/run/vc\"
-runtime_config_path = \"\${CONFIG_PATH}\"
+runtime_config_path = \"\${GO_CONFIG}\"
+privileged_without_host_devices = true
+runtime_pull_image = true
+
+[crio.runtime.runtimes.kata-\${SHIM}-runtime-rs]
+runtime_path = \"/opt/kata/runtime-rs/bin/containerd-shim-kata-v2\"
+runtime_type = \"vm\"
+runtime_root = \"/run/vc\"
+runtime_config_path = \"\${RS_CONFIG}\"
 privileged_without_host_devices = true
 runtime_pull_image = true
 EOF
@@ -284,7 +296,7 @@ TOML
 
 # Create RuntimeClasses for the kata shim.
 create_kata_runtime_class() {
-    kubectl_master "kubectl apply -f - <<'RC'
+    kubectl_master "apply -f - <<'RC'
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass
 metadata:
@@ -296,6 +308,12 @@ kind: RuntimeClass
 metadata:
   name: kata
 handler: kata
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-${KATA_SHIM}-runtime-rs
+handler: kata-${KATA_SHIM}-runtime-rs
 RC"
 }
 

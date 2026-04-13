@@ -57,6 +57,11 @@ setup() {
     if ! kubectl get sc ceph-rbd &>/dev/null; then
         skip "Requires ceph-rbd StorageClass"
     fi
+
+    # Pre-clean from any prior failed run — each test must apply its own StatefulSet spec
+    kubectl delete statefulset failover-test --ignore-not-found --timeout=30s
+    kubectl delete pvc data-failover-test-0 --ignore-not-found
+    kubectl delete pod failover-test-0 --force --grace-period=0 --ignore-not-found
 }
 
 teardown() {
@@ -83,6 +88,16 @@ teardown() {
                 fi
                 sleep 5
             done
+        fi
+    done
+
+    # Clear any Ceph blocklist entries we added (otherwise the 1-hour expiry
+    # blocks the worker from RBD on the next test run — "transport endpoint shutdown")
+    for w in kata-worker-1 kata-worker-2; do
+        local wip
+        wip=$(multipass info "$w" --format csv 2>/dev/null | tail -1 | cut -d, -f3)
+        if [[ -n "$wip" ]]; then
+            multipass exec kata-master -- sudo ceph osd blocklist rm "${wip}:0/0" 2>/dev/null || true
         fi
     done
 }
@@ -140,12 +155,20 @@ EOF
     local marker="failover-test-$(date +%s)"
     write_marker "failover-test-0" "/data/marker.txt" "$marker"
 
+    # Flush write to the backing store before killing the node (virtio-fs → host ext4 → RBD)
+    kubectl exec failover-test-0 -- sync
+
     # Verify data is readable
     local read_back
     read_back=$(read_marker "failover-test-0" "/data/marker.txt")
     [ "$read_back" = "$marker" ]
 
     # --- Simulate node failure ---
+    # Capture worker-1 IP before stopping (multipass info returns no IP for stopped VMs)
+    local w1ip
+    w1ip=$(multipass info kata-worker-1 --format csv | tail -1 | cut -d, -f3)
+    [ -n "$w1ip" ]
+
     # Stop worker-1 VM
     multipass stop --force kata-worker-1
 
@@ -177,7 +200,7 @@ EOF
     fi
 
     # Blacklist the dead node in Ceph so the RBD exclusive lock is released
-    multipass exec kata-master -- sudo ceph osd blocklist add "10.135.230.192" 2>/dev/null || true
+    multipass exec kata-master -- sudo ceph osd blocklist add "$w1ip"
 
     # Wait for pod to come up on worker-2
     run wait_pod_running "failover-test-0" 600
@@ -214,7 +237,7 @@ spec:
         io.katacontainers.volume.block-data.mount_path: "/data"
         io.katacontainers.volume.block-data.fs_type: "ext4"
     spec:
-      runtimeClassName: kata-qemu-coco-dev
+      runtimeClassName: kata-qemu-coco-dev-runtime-rs
       terminationGracePeriodSeconds: 5
       nodeSelector:
         kubernetes.io/hostname: kata-worker-1
@@ -265,6 +288,11 @@ EOF
     [ "$read_back" = "$marker" ]
 
     # --- Simulate node failure ---
+    # Capture worker-1 IP before stopping (stopped VMs have no IP in multipass info)
+    local worker1_ip
+    worker1_ip=$(multipass info kata-worker-1 --format csv | tail -1 | cut -d, -f3)
+    [ -n "$worker1_ip" ]
+
     multipass stop --force kata-worker-1
 
     # Wait for Kubernetes to detect node as NotReady
@@ -293,12 +321,7 @@ EOF
     fi
 
     # Blacklist the dead node in Ceph so the RBD exclusive lock is released immediately
-    local master_ip
-    master_ip=$(kubectl get node kata-master -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
-    local worker1_ip
-    worker1_ip="10.135.230.192"
-    # Try to add a temporary Ceph blocklist entry for the dead node
-    multipass exec kata-master -- sudo ceph osd blocklist add "$worker1_ip" 2>/dev/null || true
+    multipass exec kata-master -- sudo ceph osd blocklist add "$worker1_ip"
 
     # Wait for pod to come up on worker-2 (allow extra time for RBD reattach)
     run wait_pod_running "failover-test-0" 600
